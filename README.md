@@ -52,7 +52,3 @@ python evaluate.py --model <path-to-model> --testdata <path-to-test-data>
 
 For questions or collaborations, contact [khue.luu@g.nsu.ru](mailto:khue.luu@g.nsu.ru).
 ```
-
----
-
-Make sure to customize the repository name, dataset links, and other details according to your project specifics.
