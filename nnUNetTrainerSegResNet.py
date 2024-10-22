@@ -35,19 +35,16 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
                                    enable_deep_supervision: bool = False) -> nn.Module:
         
         label_manager = plans_manager.get_label_manager(dataset_json)
-        spatial_dims = len(configuration_manager.patch_size)
+        spatial_dims  = len(configuration_manager.patch_size)
 
-        model = SegResNet(
-            spatial_dims = spatial_dims,
-            init_filters = 32,
-            in_channels = num_input_channels,
-            out_channels = label_manager.num_segmentation_heads,
-            blocks_down = [1, 2, 2, 4],
-            blocks_up = [1, 1, 1]
+        return SegResNet(
+            spatial_dims=spatial_dims,
+            init_filters=32,
+            in_channels=num_input_channels,
+            out_channels=label_manager.num_segmentation_heads,
+            blocks_down=[1, 2, 2, 4],
+            blocks_up=[1, 1, 1]
         )
-
-        return model
-    
 
     def train_step(self, batch: dict) -> dict:
         target = batch['target']
@@ -62,14 +59,13 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         self.optimizer.zero_grad(set_to_none=True)
         
         output = self.network(data)
-        l = self.loss(output, target)
-        l.backward()
+        loss = self.loss(output, target)
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
         self.optimizer.step()
         
-        return {'loss': l.detach().cpu().numpy()}
+        return {'loss': loss.detach().cpu().numpy()}
     
-
     def validation_step(self, batch: dict) -> dict:
         target = batch['target']
         data   = batch['data']
@@ -85,7 +81,7 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         # Autocast will only be active if there is a cuda device.
         output = self.network(data)
         del data
-        l = self.loss(output, target)
+        loss = self.loss(output, target)
 
         # show on-the-fly evaluation
         axes = [0] + list(range(2, output.ndim))
@@ -93,8 +89,7 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         if self.label_manager.has_regions:
             predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
         else:
-            # no need for softmax
-            output_seg = output.argmax(1)[:, None]
+            output_seg = output.argmax(1)[:, None] # no need for softmax
             predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
             predicted_segmentation_onehot.scatter_(1, output_seg, 1)
             del output_seg
@@ -104,7 +99,7 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
                 mask = (target != self.label_manager.ignore_label).float()
                 target[target == self.label_manager.ignore_label] = 0
             else:
-                mask = 1 - target[:, -1:]
+                mask   = 1 - target[:, -1:]
                 target = target[:, :-1]
         else:
             mask = None
@@ -114,17 +109,32 @@ class nnUNetTrainerSegResNet(nnUNetTrainerNoDeepSupervision):
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
+        
         if not self.label_manager.has_regions:
             tp_hard = tp_hard[1:] # remove the background
             fp_hard = fp_hard[1:] # remove the background
             fn_hard = fn_hard[1:] # remove the background
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {
+            'loss'   : loss.detach().cpu().numpy(),
+            'tp_hard': tp_hard,
+            'fp_hard': fp_hard,
+            'fn_hard': fn_hard
+        }
     
     def configure_optimizers(self):
-
-        optimizer = Adam(self.network.parameters(), lr=self.initial_lr, weight_decay=self.weight_decay, eps=1e-5)
-        scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs, exponent=0.9)
+        optimizer = Adam(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            eps=1e-5
+        )
+        scheduler = PolyLRScheduler(
+            optimizer,
+            self.initial_lr,
+            self.num_epochs,
+            exponent=0.9
+        )
 
         return optimizer, scheduler
     
