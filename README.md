@@ -1,18 +1,8 @@
-# BrainMetaSeg
+# BrainMetaSeg: Transfer Learning Approaches for Brain Metastases Screenings
 
-This repository contains the code and resources for the research project on **Brain Metastasis Segmentation** using deep learning techniques. The focus of the project is on improving the segmentation of brain metastases using a variety of medical imaging datasets, particularly leveraging models fine-tuned with limited annotated data.
+This repository contains the code for our research on **Transfer Learning Approaches for Brain Metastases Screenings**. This work explores different models and transfer learning strategies for brain metastasis segmentation using MRI data. We utilize the BraTS Metastases 2024 dataset and a private dataset for model training and evaluation.
 
-## Project Overview
-
-Brain metastasis is a critical condition that requires precise detection and segmentation from medical images such as MRI. Accurate segmentation is crucial for effective treatment planning. This project aims to address the challenges of segmenting brain metastases by using advanced 3D convolutional neural networks (CNNs) and techniques that minimize the need for extensive labeled datasets.
-
-
-## Features
-- **Brain Metastasis Segmentation**: Automated segmentation of brain metastases from MRI volumes.
-- **3D UNet**: A robust architecture for handling 3D medical imaging data.
-- **Performance Metrics**: High accuracy measured with the Dice similarity coefficient.
-- **Minimal Labeled Data**: Use of transfer learning to reduce the dependency on large annotated datasets.
-
+**Research Paper**: [Transfer Learning Approaches for Brain Metastases Screenings](#) _(Link TBA)_
 
 ## Installation
 
@@ -26,29 +16,34 @@ Brain metastasis is a critical condition that requires precise detection and seg
    pip install -r requirements.txt
    ```
 
+3. Install `nnUNetv2` from source:
+   ```bash
+   git clone https://github.com/MIC-DKFZ/nnUNet.git
+   cd nnUNet
+   pip install -e .
+   ```
+
+4. Copy the custom trainer files to the `nnunetv2/training/` directory:
+   ```bash
+   cp -r BrainMetaSeg/trainers/* nnunetv2/training/nnUNetTrainer/
+   ```
+
 ## Usage
 
-To train the model or run inference on new MRI data, follow the steps below:
+To train, run inference, or evaluate the model on MRI data, follow the steps below:
 
 ### Training
-To train the model on the dataset:
-```bash
-python train.py --dataset <path-to-dataset>
-```
+
+TBA
 
 ### Inference
-To run the model for inference on new MRI scans:
-```bash
-python inference.py --input <path-to-input-image>
-```
+
+TBA
 
 ### Evaluation
-To evaluate the model on the test dataset:
-```bash
-python evaluate.py --model <path-to-model> --testdata <path-to-test-data>
-```
+
+TBA
 
 ## Contact
 
 For questions or collaborations, contact [khue.luu@g.nsu.ru](mailto:khue.luu@g.nsu.ru).
-```
