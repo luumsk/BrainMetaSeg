@@ -1,0 +1,13 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+torch = "==2.0.1"
+torchvision = "==0.15.2"
+monai = "==1.3.0"
+nibabel = "==5.2.1"
+numpy = "==1.26.4"
+
+
