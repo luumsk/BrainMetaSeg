@@ -23,7 +23,7 @@
         1,
         3
     ],
-    "numTraining": 26,
+    "numTraining": 652,
     "file_ending": ".nii.gz",
     "overwrite_image_reader_writer": "SimpleITKIO"
 }
