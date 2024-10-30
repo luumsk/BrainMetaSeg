@@ -8,10 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 os.environ["nnUNet_raw"] = "data/nnUNet_raw"
 os.environ["nnUNet_preprocessed"] = "data/nnUNet_preprocessed"
 os.environ["nnUNet_results"] = "data/nnUNet_results"
-
-print("nnUNet_raw:", os.environ.get("nnUNet_raw"))
-print("nnUNet_preprocessed:", os.environ.get("nnUNet_preprocessed"))
-print("nnUNet_results:", os.environ.get("nnUNet_results"))
+os.environ["nnUNet_output"] = "data/nnUNet_output"
 
 app = FastAPI()
 
@@ -53,18 +50,18 @@ async def segment(files: list[UploadFile] = File(...), background_tasks: Backgro
                 temp_file.write(await file.read())
             temp_input_paths.append(file_path)
 
-        output_dir = os.path.join(os.environ.get("nnUNet_results"), "Dataset111_Meta", "nnUNetTrainer_TverskyBCE__nnUNetPlans__3d_fullres")
+        temp_output_dir = os.environ.get("nnUNet_output")
         command = [
             "nnUNetv2_predict",
             "-i", temp_input_dir,
-            "-o", output_dir,
+            "-o", temp_output_dir,
             "-d", "111",  # dataset id
             "-f", "0",  # fold 0
             "-c", "3d_fullres",  # configuration
             "-tr", "nnUNetTrainer_TverskyBCE",  # trainer
-            "-chk", "checkpoint_final.pth"
+            "-chk", "checkpoint_final.pth",
+            "--disable_progress_bar"
         ]
-        print(command)
 
         # Execute the command
         try:
@@ -73,15 +70,15 @@ async def segment(files: list[UploadFile] = File(...), background_tasks: Backgro
             return JSONResponse(content={"error": f"Prediction failed: {e}"}, status_code=500)
 
         # Locate the output segmentation file in the output directory
-        output_file_path = os.path.join(output_dir, os.listdir(output_dir)[0])
-        print('output file path:', output_file_path)
+        output_filename = [fn for fn in os.listdir(temp_output_dir) if fn.endswith('.nii.gz')][0]
+        output_file_path = os.path.join(temp_output_dir, output_filename)
 
         # Return the segmented NIfTI file as the response
         response = FileResponse(output_file_path, media_type="application/gzip", filename="segmentation_output.nii.gz")
 
         # # Add cleanup task to delete temporary input files after response
         # background_tasks.add_task(cleanup_temp_files, temp_input_paths)
-        # background_tasks.add_task(cleanup_temp_files, [output_file_path])
+        # background_tasks.add_task(cleanup_temp_files, os.listdir(temp_output_dir))
 
         return response
 
