@@ -4,6 +4,10 @@ import subprocess
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+os.environ["nnUNet_raw"] = "data/nnUNet_raw"
+os.environ["nnUNet_preprocessed"] = "data/nnUNet_preprocessed"
+os.environ["nnUNet_results"] = "data/nnUNet_results"
+
 app = FastAPI()
 
 @app.get("/", status_code=200)
@@ -29,6 +33,7 @@ async def segment(files: list[UploadFile] = File(...)):
             status_code=400
         )
 
+    print('Saving input files...')
     # Save each uploaded file temporarily
     temp_input_paths = []
     for file in files:
@@ -36,17 +41,20 @@ async def segment(files: list[UploadFile] = File(...)):
             temp_input_file.write(await file.read())
             temp_input_paths.append(temp_input_file.name)
 
+    print('Creating temp output folder...')
     # Create a temporary directory for the output
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        # Construct the command to execute `predict_from_raw_data.py`
         command = [
-            "python", "predict_from_raw_data.py",
+            "nnUNetv2_predict",
             "-i", ",".join(temp_input_paths),
             "-o", temp_output_dir,
-            "-d", 111, # dataset id
+            "-d", "111", # dataset id
             "-f", "0", # fold 0
+            "-c", "3d_fullres", # configuration,
+            "-tr", "nnUNetTrainer_TverskyBCE", # trainer
             "-chk", "checkpoint_final.pth"
         ]
+        print(command)
 
         # Execute the command
         try:
