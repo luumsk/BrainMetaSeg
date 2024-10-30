@@ -9,10 +9,6 @@ RUN git clone https://github.com/MIC-DKFZ/nnUNet.git
 WORKDIR /nnUNet
 RUN pip install -e .
 
-ENV nnUNet_raw="data/nnUNet_raw"
-ENV nnUNet_preprocessed="data/nnUNet_preprocessed"
-ENV nnUNet_results="data/nnUNet_results"
-
 COPY trainers/nnUNetTrainer_TverskyBCE.py /nnUNet/nnunetv2/training/nnUNetTrainer/nnUNetTrainer_TverskyBCE.py
 COPY app.py /app.py
 COPY data/ /data/
