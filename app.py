@@ -28,7 +28,8 @@ async def root():
 
 def cleanup_temp_files(paths):
     for path in paths:
-        os.remove(path)
+        if os.path.exists(path):
+            os.remove(path)
 
 @app.post("/segment/")
 async def segment(files: list[UploadFile] = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
@@ -70,15 +71,15 @@ async def segment(files: list[UploadFile] = File(...), background_tasks: Backgro
             return JSONResponse(content={"error": f"Prediction failed: {e}"}, status_code=500)
 
         # Locate the output segmentation file in the output directory
-        output_filename = [fn for fn in os.listdir(temp_output_dir) if fn.endswith('.nii.gz')][0]
-        output_file_path = os.path.join(temp_output_dir, output_filename)
+        temp_output_paths = [os.path.join(temp_output_dir, fn) for fn in os.listdir(temp_output_dir)]
+        output_file_path = [pth for pth in temp_output_paths if pth.endswith('.nii.gz')][0]
 
         # Return the segmented NIfTI file as the response
         response = FileResponse(output_file_path, media_type="application/gzip", filename="segmentation_output.nii.gz")
 
-        # # Add cleanup task to delete temporary input files after response
-        # background_tasks.add_task(cleanup_temp_files, temp_input_paths)
-        # background_tasks.add_task(cleanup_temp_files, os.listdir(temp_output_dir))
+        # Schedule cleanup for only the temporary input files
+        background_tasks.add_task(cleanup_temp_files, temp_input_paths)
+        background_tasks.add_task(cleanup_temp_files, temp_output_paths)
 
         return response
 
