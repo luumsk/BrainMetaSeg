@@ -13,6 +13,11 @@ COPY trainers/nnUNetTrainer_TverskyBCE.py /nnUNet/nnunetv2/training/nnUNetTraine
 COPY app.py /app.py
 COPY data/ /data/
 
+ENV nnUNet_raw="data/nnUNet_raw"
+ENV nnUNet_preprocessed="data/nnUNet_preprocessed"
+ENV nnUNet_results="data/nnUNet_results"
+ENV nnUNet_output="data/nnUNet_output"
+
 WORKDIR /
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

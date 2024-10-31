@@ -1,26 +1,14 @@
-import os, glob
+import os
+import glob
+import torch
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
-import torch
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
-from nnunetv2.utilities.file_path_utilities import get_output_folder
 
-# Set nnUNet environment variables
-os.environ["nnUNet_raw"] = "data/nnUNet_raw"
-os.environ["nnUNet_preprocessed"] = "data/nnUNet_preprocessed"
-os.environ["nnUNet_results"] = "data/nnUNet_results"
-os.environ["nnUNet_output"] = "data/nnUNet_output"
 
 app = FastAPI()
 
-# Initialize nnUNetPredictor on startup
-model_folder = get_output_folder(
-    dataset_name_or_id="Dataset111_Meta",
-    trainer_name="nnUNetTrainer_TverskyBCE",
-    plans_identifier="nnUNetPlans",
-    configuration="3d_fullres"
-)
-
+model_folder = "data/nnUNet_results/Dataset111_Meta/nnUNetTrainer_TverskyBCE__nnUNetPlans__3d_fullres"
 predictor = None
 
 @app.on_event("startup")
@@ -30,7 +18,7 @@ def load_model():
         tile_step_size=0.5,
         use_gaussian=True,
         use_mirroring=True,
-        perform_everything_on_device=True,
+        perform_everything_on_device=True if torch.cuda.is_available() else False,
         device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
         verbose=False,
         verbose_preprocessing=False,
@@ -66,10 +54,11 @@ async def segment(files: list[UploadFile] = File(...), background_tasks: Backgro
             status_code=400
         )
 
+    # Define temporary directories
     temp_input_dir = os.environ.get("nnUNet_raw")
     temp_output_dir = os.environ.get("nnUNet_output")
 
-    # Save uploaded .nii.gz files directly to the temporary directory
+    # Save uploaded .nii.gz files directly to the temporary input directory
     for file in files:
         file_path = os.path.join(temp_input_dir, file.filename)
         with open(file_path, "wb") as temp_file:
@@ -84,16 +73,17 @@ async def segment(files: list[UploadFile] = File(...), background_tasks: Backgro
             overwrite=True,
             num_processes_preprocessing=1,
             num_processes_segmentation_export=1,
-            folder_with_segs_from_prev_stage=None
         )
-        
     except Exception as e:
         return JSONResponse(content={"error": f"Prediction failed: {e}"}, status_code=500)
 
+    # Find the output .nii.gz file
     output_file_path = next(glob.iglob(os.path.join(temp_output_dir, "*.nii.gz")), None)
+    if not output_file_path or not os.path.isfile(output_file_path):
+        return JSONResponse(content={"error": "Prediction completed, but no output file was generated."}, status_code=500)
 
     # Return the segmented NIfTI file as the response
-    response = FileResponse(output_file_path, media_type="application/gzip", filename="segmentation_output.nii.gz")
+    response = FileResponse(output_file_path, media_type="application/nii.gz", filename="segmentation_output.nii.gz")
 
     # Schedule cleanup for temporary files
     background_tasks.add_task(cleanup_temp_files, temp_input_dir)
