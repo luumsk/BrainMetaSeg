@@ -47,12 +47,13 @@ nnUNetv2_plan_and_preprocess -d DATASET_ID --verify_dataset_integrity
 
 ### Training
 
-Train from scratch
+**Train from scratch**
+
 ```bash
 nnUNetv2_train DATASET_ID CONGIFURATION FOLD -tr TRAINER_NAME
 ```
 
-Fine-tuning
+**Fine-tuning**
 
 nnUNet requires aligned datasets fingerprints before fine-tuning. See intructions [here](https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/pretraining_and_finetuning.md).
 ```bash
