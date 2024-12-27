@@ -6,14 +6,14 @@ This repository contains the code for our research on **Transfer Learning Approa
 
 ## Installation
 
-1. Clone only this branch of the repository:
+1. Clone the repository:
    ```bash
-   git clone --branch metastases2024 --single-branch git@bigdata.nsu.ru:medical/BraTS23.git
+   git clone https://github.com/luumsk/BrainMetaSeg.git
    ```
 
 2. Change directory to the repo
    ```bash
-   cd BraTS23
+   cd BrainMetaSeg
    ```
 
 3. Install the required dependencies:
@@ -47,19 +47,16 @@ nnUNetv2_plan_and_preprocess -d DATASET_ID --verify_dataset_integrity
 
 ### Training
 
+Train from scratch
 ```bash
-nnUNetv2_train DATASET_ID CONGIFURATION FOLD -tr TRAINER_NAME -pretrained_weights <path_to_pretrained_weights>
+nnUNetv2_train DATASET_ID CONGIFURATION FOLD -tr TRAINER_NAME
 ```
 
-If you have multiple CUDA devices, you can specify which device is being used for this training process with CUDA_VISIBLE_DEVICES=<cuda_id>.
+Fine-tuning
 
-In this example, we use CUDA device id `0`, DATASET_ID `111`, configuration `3d_fullres`, fold `1`, trainer `nnUNetTrainer_TverskyBCE`, path to pretrained weights is `/media/storage/luu/nnUNet_results/Dataset111_Meta/nnUNetTrainer_TverskyBCE__nnUNetPlans_aligned__3d_fullres/fold_all/checkpoint_final.pth`
-
+nnUNet requires aligned datasets fingerprints before fine-tuning. See intructions [here](https://github.com/MIC-DKFZ/nnUNet/blob/master/documentation/pretraining_and_finetuning.md).
 ```bash
-CUDA_VISIBLE_DEVICES=0 nnUNetv2_train \
-    111 3d_fullres 1 \
-    -tr nnUNetTrainer_TverskyBCE \
-    -pretrained_weights /media/storage/luu/nnUNet_results/Dataset111_Meta/nnUNetTrainer_TverskyBCE__nnUNetPlans_aligned__3d_fullres/fold_all/checkpoint_final.pth
+nnUNetv2_train DATASET_ID CONGIFURATION FOLD -tr TRAINER_NAME -pretrained_weights <path_to_pretrained_weights>
 ```
 
 ### Inference
@@ -77,20 +74,6 @@ CUDA_VISIBLE_DEVICES=0 nnUNetv2_train \
          -tr TRAINER_NAME \
          --disable_progress_bar \
          --save_probabilities
-   ```
-
-   In this example, we train DATASET_ID `111`, configuration `3d_fullres`, fold `1`, trainer `nnUNetTrainerSegResNet`
-
-   ```bash
-   nnUNetv2_predict \
-      -i /media/storage/luu/nnUNet_raw/Dataset222_SBT/imagesTs \
-      -o /media/storage/luu/nnUNet_predictions/Dataset222_SBT/segresnet_finetune_preds/fold_1 \
-      -d 111 \
-      -c 3d_fullres \
-      -f 1 \
-      -tr nnUNetTrainerSegResNet \
-      --disable_progress_bar \
-      --save_probabilities
    ```
 
 ### Evaluation
