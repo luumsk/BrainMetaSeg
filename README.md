@@ -33,6 +33,11 @@ This repository contains the code for our research on **Transfer Learning Approa
    cp -r trainers/* nnunetv2/training/nnUNetTrainer/
    ```
 
+6. Set up paths to nnUNet folders in the `scripts/setvars.sh` and execute this script
+   ```bash
+   source scripts/setvars.sh
+   ```
+
 ## Usage
 
 To train, run inference, or evaluate the model on MRI data, follow the steps below:
