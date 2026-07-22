@@ -8,7 +8,7 @@
 SEG_DIR="tumor_volume"
 OUTPUT_CSV="./tumor_volumes.csv"
 PATIENT_ID=""                                  
-FILENAME_PATTERN='(?P<date>\d{4}-\d{2})\.nii\.gz$'
+FILENAME_PATTERN='(?P<date>\d{4}[-_]\d{2})\.nii\.gz$'   # matches YYYY-MM or YYYY_MM before .nii.gz
 
 CONNECTIVITY=26                                # 6, 18, or 26
 MIN_VOLUME_MM3=8                               # drop components smaller than this (noise filter)

@@ -3,9 +3,11 @@
 
 Each file is a binary segmentation mask for one scan date (may contain
 multiple disconnected tumor instances, e.g. several metastases). The scan
-date is parsed from the filename (default pattern expects "YYYY-MM"; override
-with --filename-pattern if yours differs) so timepoints are ordered
-chronologically and real day-deltas can be computed between them.
+date is parsed from the filename (default pattern expects "YYYY-MM" or
+"YYYY_MM" right before ".nii.gz", e.g. "tumor_2021-03.nii.gz" or
+"flair_2021_03.nii.gz"; override --filename-pattern if yours differs) so
+timepoints are ordered chronologically and real day-deltas can be computed
+between them.
 
 Per-timepoint volume is always computed from that file's own header, so
 timepoints do NOT need to share a grid. Cross-timepoint matching, however,
@@ -66,7 +68,7 @@ from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger("tumor_tracking")
 
-DEFAULT_FILENAME_PATTERN = r"(?P<date>\d{4}-\d{2})\.nii\.gz$"
+DEFAULT_FILENAME_PATTERN = r"(?P<date>\d{4}[-_]\d{2})\.nii\.gz$"
 
 
 @dataclass
@@ -79,7 +81,7 @@ class Settings:
 
 @dataclass
 class TimepointFile:
-    label: str  # e.g. "2021-03", taken verbatim from the filename
+    label: str  # normalized "YYYY-MM", regardless of "-" or "_" in the filename
     date: pd.Timestamp
     path: Path
 
@@ -99,8 +101,8 @@ def discover_timepoints(seg_dir: Path, filename_pattern: str) -> list[TimepointF
         match = pattern.search(path.name)
         if not match:
             continue
-        date_str = match.group("date")
-        timepoints.append(TimepointFile(label=date_str, date=pd.to_datetime(date_str), path=path))
+        label = match.group("date").replace("_", "-")
+        timepoints.append(TimepointFile(label=label, date=pd.to_datetime(label), path=path))
 
     if not timepoints:
         raise FileNotFoundError(f"No files matching pattern '{filename_pattern}' found in {seg_dir}")
@@ -528,13 +530,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Track tumor instances across dated segmentation files and measure volume over time.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--seg-dir", required=True, type=Path, help="Folder containing tumor_YYYY-MM.nii.gz files")
+    parser.add_argument("--seg-dir", required=True, type=Path, help="Folder containing dated segmentation files, e.g. tumor_YYYY-MM.nii.gz or flair_YYYY_MM.nii.gz")
     parser.add_argument("--output-csv", required=True, type=Path, help="Path to write the long-format tumor volume/tracking CSV")
     parser.add_argument("--patient-id", default=None, help="Label for the patient_id column (defaults to the --seg-dir folder name)")
     parser.add_argument(
         "--filename-pattern",
         default=DEFAULT_FILENAME_PATTERN,
-        help="Regex with a named group 'date' (YYYY-MM) used to find and order segmentation files",
+        help="Regex with a named group 'date' (YYYY-MM or YYYY_MM) used to find and order segmentation files",
     )
 
     parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=26)
