@@ -30,13 +30,6 @@ export PATH=$PATH:/usr/bin
 pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
 ```
 
-- To install `mamba` (only needed for training/inference with the UMamba trainers), run:
-
-```bash
-pip install "causal-conv1d>=1.2.0" --no-build-isolation
-pip install mamba-ssm --no-cache-dir
-```
-
 To install `nnUNetv2` locally, run this from the repo root (NOT from inside `nnunetv2/` - `setup.py` lives at the repo root since `nnunetv2/` itself is the package directory):
 
 For example:
