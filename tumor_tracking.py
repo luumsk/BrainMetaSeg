@@ -118,7 +118,16 @@ def discover_timepoints(seg_dir: Path, filename_pattern: str) -> list[TimepointF
 
 def load_mask(path: Path) -> tuple[np.ndarray, tuple[float, float, float], np.ndarray]:
     image = nib.load(str(path))
-    data = np.asarray(image.dataobj) > 0
+    raw = np.asarray(image.dataobj)
+
+    # Multi-class segmentations (e.g. necrotic core/edema/enhancing labeled
+    # 1/2/3) are merged into one binary "whole tumor" mask here, before any
+    # connected-component/tracking logic runs downstream.
+    labels_present = np.unique(raw[raw != 0])
+    if labels_present.size > 1:
+        logger.debug("%s: merging labels %s into one binary tumor mask", path.name, labels_present.tolist())
+    data = raw > 0
+
     spacing = tuple(float(v) for v in image.header.get_zooms()[:3])
     return data, spacing, image.affine
 
