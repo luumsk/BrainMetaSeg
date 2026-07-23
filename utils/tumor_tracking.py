@@ -2,53 +2,25 @@
 """Track tumor instances across timepoints and measure their volume over time.
 
 Each file is a binary segmentation mask for one scan date (may contain
-multiple disconnected tumor instances, e.g. several metastases). The scan
-date is parsed from the filename (default pattern expects "YYYY-MM" or
-"YYYY_MM" right before ".nii.gz", e.g. "tumor_2021-03.nii.gz" or
-"flair_2021_03.nii.gz"; override --filename-pattern if yours differs) so
-timepoints are ordered chronologically and real day-deltas can be computed
-between them.
+several disconnected instances, e.g. multiple metastases). The scan date is
+parsed from the filename (default: "YYYY-MM"/"YYYY_MM" before ".nii.gz";
+override --filename-pattern if yours differs).
 
-Per-timepoint volume is always computed from that file's own header, so
-timepoints do NOT need to share a grid. Cross-timepoint matching, however,
-auto-detects whether two consecutive timepoints are actually co-registered
-(same shape and affine):
-* If they are, instances are matched with a Hungarian assignment on voxel
-  overlap/Dice/centroid/surface-distance -- accurate spatial matching.
-* If they aren't (common for real longitudinal scans: different FOV, slice
-  thickness, or scanner between visits), it falls back to matching by
-  descending-volume rank (see `match_by_volume_rank`), which is a much
-  weaker assumption and can misfire if the number or relative size of
-  tumors changes between visits. Register scans to a common grid first if
-  you need reliable identity tracking with multiple simultaneous tumors.
+Per-timepoint volume always uses that file's own header, so timepoints don't
+need to share a grid. Cross-timepoint matching auto-detects co-registration:
+if two consecutive timepoints share shape/affine, instances are matched via
+Hungarian assignment on overlap/Dice/centroid/surface-distance; otherwise it
+falls back to matching by descending-volume rank, which is weaker and can
+misfire if tumor count or size-ranking changes between visits.
 
-What this does now
--------------------
-1. Extracts 3D connected components ("tumor instances") per timepoint.
-2. Matches instances across consecutive timepoints and assigns a stable
-   `tumor_id` to each track (see matching behavior above).
-3. Measures volume (+ basic centroid/bbox geometry) per instance per
-   timepoint and writes one long-format CSV, ready to group by `tumor_id` and
-   plot volume vs. date.
-4. Flags tracks that only ever appear at one timepoint via
-   `is_single_timepoint_track` -- a stronger noise signal than volume alone,
-   since a real small/early lesion can be the same size as a segmentation
-   noise blob. Pass `--drop-single-timepoint-tracks` to remove them outright.
-
-Extension points (not implemented yet, by design)
---------------------------------------------------
-* Boundary contrast against a co-registered intensity image (e.g. T1c):
-  add an `image` argument to `compute_lesion_metrics()` and sample a ring
-  around `mask` (e.g. via scipy.ndimage.distance_transform_edt) the same way
-  volume is sampled now.
-* Boundary/shape tracking over time: `--save-cc-maps` already persists the
-  labeled connected-component volume for every timepoint, so a later script
-  can load `{timepoint}_cc.nii.gz` + this CSV's `tumor_id`/`component_id`
-  mapping without recomputing connected components from scratch.
+Tracks that only ever appear at one timepoint are flagged via
+`is_single_timepoint_track` (pass --drop-single-timepoint-tracks to remove
+them) -- a stronger noise signal than a volume threshold, since a real
+small/early lesion can be the same size as a noise blob.
 
 Usage
 -----
-    python tumor_tracking.py \\
+    python utils/tumor_tracking.py \\
         --seg-dir /data/patient1/segmentations \\
         --output-csv /data/patient1/tumor_volumes.csv \\
         --save-cc-maps
@@ -124,9 +96,7 @@ def load_mask(path: Path) -> tuple[np.ndarray, tuple[float, float, float], np.nd
     image = nib.load(str(path))
     raw = np.asarray(image.dataobj)
 
-    # Multi-class segmentations (e.g. necrotic core/edema/enhancing labeled
-    # 1/2/3) are merged into one binary "whole tumor" mask here, before any
-    # connected-component/tracking logic runs downstream.
+    # Merge multi-class labels (e.g. necrotic/edema/enhancing = 1/2/3) into one binary mask.
     labels_present = np.unique(raw[raw != 0])
     if labels_present.size > 1:
         logger.debug("%s: merging labels %s into one binary tumor mask", path.name, labels_present.tolist())
@@ -157,11 +127,7 @@ def extract_components(
     min_volume_mm3: float,
     spacing: tuple[float, float, float],
 ) -> tuple[np.ndarray, int]:
-    """Label connected tumor instances, drop tiny ones (segmentation noise).
-
-    Remaining instances are renumbered 1..k, ordered by descending volume so
-    component 1 is always the largest tumor at that timepoint.
-    """
+    """Label connected tumor instances, drop tiny ones, renumber 1..k by descending volume."""
     structure = connectivity_structure(connectivity)
     raw_map, n_raw = ndimage.label(mask, structure=structure)
     if n_raw == 0:
@@ -199,11 +165,6 @@ def bbox_slices(mask: np.ndarray, pad: int, shape: tuple[int, ...]) -> tuple[sli
 
 # --------------------------------------------------------------------------
 # Per-instance metrics
-#
-# This is the extension point for future per-lesion measurements (contrast,
-# shape, boundary descriptors, ...): add more key/value pairs to the dict
-# returned here, threading through whatever extra inputs (e.g. an intensity
-# image) they need.
 # --------------------------------------------------------------------------
 
 
@@ -256,11 +217,7 @@ def dice_score(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
 
 
 def min_surface_distance_mm(mask_a: np.ndarray, mask_b: np.ndarray, spacing: tuple[float, float, float]) -> float:
-    """Min distance (mm) between any voxel of A and any voxel of B.
-
-    Uses a distance transform on a padded shared bounding box, which stays
-    fast even for large tumors (avoids O(n*m) pairwise point distances).
-    """
+    """Min distance (mm) between any voxel of A and B, via a cropped distance transform."""
     if mask_a.sum() == 0 or mask_b.sum() == 0:
         return float("inf")
 
@@ -278,12 +235,7 @@ def build_cost_matrix(
     spacing: tuple[float, float, float],
     settings: Settings,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Cost matrix for Hungarian assignment, plus a boolean candidate mask.
-
-    A pair is only a valid candidate if it overlaps or is close by
-    centroid/surface distance -- this keeps far-apart tumors from ever being
-    matched even when the assignment would otherwise be unbalanced.
-    """
+    """Cost matrix for Hungarian assignment, plus a candidate mask (overlap or close centroid/surface only)."""
     n_a, n_b = len(ids_a), len(ids_b)
     cost = np.full((n_a, n_b), np.inf)
     is_candidate = np.zeros((n_a, n_b), dtype=bool)
@@ -345,27 +297,12 @@ def match_timepoint_pair(
 def is_same_grid(
     shape_a: tuple[int, ...], shape_b: tuple[int, ...], affine_a: np.ndarray, affine_b: np.ndarray
 ) -> bool:
-    """Whether two timepoints share one voxel grid (so array indices line up).
-
-    Longitudinal clinical scans are frequently *not* resliced to a common
-    grid between visits (different FOV/matrix, slice thickness, or even
-    scanner). Voxel-overlap/Dice/surface-distance are only meaningful when
-    this is true; otherwise fall back to `match_by_volume_rank`.
-    """
+    """Whether two timepoints share one voxel grid (array indices line up)."""
     return shape_a == shape_b and np.allclose(affine_a, affine_b, atol=1e-2)
 
 
 def match_by_volume_rank(ids_a: list[int], ids_b: list[int]) -> dict[int, int]:
-    """Fallback match for timepoints that aren't on a common grid.
-
-    `extract_components` already numbers components 1..k by descending
-    volume within each timepoint, so pairing id i in A with id i in B is
-    equivalent to matching largest-to-largest, 2nd-largest-to-2nd-largest,
-    etc. This is a much weaker assumption than true spatial correspondence
-    (it can misfire if the number or size-ranking of tumors changes between
-    visits) but it's the best available signal without registering the
-    scans to a shared grid first.
-    """
+    """Fallback match for non-co-registered timepoints: pair by descending-volume rank."""
     return dict(zip(ids_a, ids_b))
 
 
@@ -382,12 +319,7 @@ def build_global_tracks(
     settings: Settings,
     id_prefix: str,
 ) -> pd.DataFrame:
-    """Chain consecutive-timepoint matches into global tumor tracks.
-
-    Only directly consecutive timepoints are matched (no gap-bridging across
-    a timepoint where a tumor was missed) -- simple and robust; revisit if
-    you need to bridge dropouts.
-    """
+    """Chain consecutive-timepoint matches into global tumor tracks (no gap-bridging)."""
     next_id = 1
     active_tracks: dict[int, str] = {}
     records = []  # (timepoint, component_id, tumor_id)
@@ -466,14 +398,7 @@ def add_growth_columns(df: pd.DataFrame, dates: dict[str, pd.Timestamp]) -> pd.D
 
 
 def add_persistence_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag tumor instances that only ever appear at one timepoint.
-
-    A component that never recurs at the next scan is far more likely to be
-    an isolated false-positive blob than a real lesion -- real tumors persist
-    or at least get re-checked at the next visit, whereas a volume threshold
-    alone can't tell a real small/early lesion apart from a noise blob of the
-    same size.
-    """
+    """Flag tumor instances that only ever appear at one timepoint (likely noise)."""
     df = df.copy()
     df["track_length"] = df.groupby("tumor_id")["tumor_id"].transform("size")
     df["is_single_timepoint_track"] = df["track_length"] == 1
@@ -507,12 +432,6 @@ def run(
     for tp in timepoints:
         mask, tp_spacing, tp_affine = load_mask(tp.path)
 
-        # Timepoints are NOT required to share one grid: real longitudinal
-        # scans routinely differ in shape/spacing/position between visits
-        # (different FOV, slice thickness, or scanner). Each timepoint's
-        # volume is always computed with its own spacing; cross-timepoint
-        # matching auto-detects whether voxel-overlap is meaningful (see
-        # `is_same_grid` / `build_global_tracks`).
         cc_map, n_components = extract_components(mask, settings.connectivity, settings.min_volume_mm3, tp_spacing)
         cc_maps[tp.label] = cc_map
         dates[tp.label] = tp.date
@@ -589,12 +508,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--drop-single-timepoint-tracks",
         action="store_true",
-        help=(
-            "Remove tumor instances that only ever appear at one timepoint across the whole "
-            "study (a much stronger noise signal than volume alone -- real lesions persist or "
-            "get re-checked at the next visit). Rows are always tagged via 'is_single_timepoint_track' "
-            "regardless of this flag; this just controls whether they're dropped before writing the CSV."
-        ),
+        help="Remove tumor instances that only ever appear at one timepoint (likely noise); always tagged via 'is_single_timepoint_track' regardless",
     )
 
     parser.add_argument(

@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """Plot tumor volume over time from tumor_tracking.py's output CSV.
 
-Reads the long-format CSV produced by `tumor_tracking.py` (or
-`scripts/run_tumor_tracking.sh`) -- one row per tracked tumor per timepoint,
-with at least: patient_id, tumor_id, date, volume_cm3 -- and draws a
-RANO-BM-style volume-over-time chart per tracked tumor:
-
-* the volume trend line (mL) across all timepoints for that tumor_id
-* the running nadir (lowest volume seen so far) marked and labeled
-* a progression-threshold reference line (nadir x (1 + --progression-threshold),
-  default 40% above nadir) with the first timepoint that crosses it flagged
-
-This mirrors the nadir/progression logic clinicians use to call disease
-progression (RANO-BM/RECIST-style: compare each follow-up to the lowest
-volume observed since baseline, not to baseline itself).
+Reads the long-format CSV (patient_id, tumor_id, date, volume_cm3, ...) and
+draws a RANO-BM-style volume-over-time chart per tumor_id: the volume trend
+line, the running nadir (lowest volume seen so far), and a progression
+threshold line (nadir x (1 + --progression-threshold), default 40%) with
+each crossing flagged -- mirrors how clinicians call disease progression
+against the lowest volume seen since baseline, not baseline itself.
 
 Usage
 -----
-    python plot_tumor_volume.py --input-csv tumor_volumes.csv
+    python utils/plot_tumor_volume.py --input-csv tumor_volumes.csv
 
 If the CSV contains more than one tumor_id, one plot (and one text summary)
 is written per tumor_id. Restrict to specific tracks with --tumor-id.
@@ -66,15 +59,11 @@ def load_tracking_csv(input_csv: Path) -> pd.DataFrame:
 def compute_nadir_progression(
     dates: np.ndarray, volumes: np.ndarray, progression_threshold: float
 ) -> dict:
-    """Running nadir + every progression *onset* (RANO-BM/RECIST-style).
+    """Running nadir + every progression *onset* (rising edge above nadir*(1+threshold)).
 
-    A timepoint is "above threshold" when its volume is >= (1 + threshold)
-    times the lowest volume observed up to and including that timepoint (the
-    running nadir). Volume can cross back under the threshold later (e.g. the
-    tumor shrinks again) and then cross it again after a later, lower nadir --
-    each such crossing is a distinct clinical episode, so every rising edge
-    (not just the first ever) is reported as its own progression event,
-    paired with the nadir it was measured against.
+    Volume can dip back under the threshold and cross it again after a later,
+    lower nadir -- each such crossing is its own episode, paired with the
+    nadir it was measured against.
     """
     running_nadir = np.minimum.accumulate(volumes)
     threshold_line = running_nadir * (1.0 + progression_threshold)
@@ -138,11 +127,7 @@ def format_summary_text(
 
 
 def _annotate_marker(ax, x, y, text: str, arrow_color: str, y_top: float, offset: int = 34) -> None:
-    """Place a leader-lined label above or below its point, whichever has room.
-
-    Points near the bottom of the y-range get labeled above (and vice versa)
-    so labels never run into the x-axis tick labels or off the top of the figure.
-    """
+    """Place a leader-lined label above or below its point, whichever has room."""
     place_above = y < y_top * 0.5
     ax.annotate(
         text,
@@ -228,9 +213,7 @@ def plot_tumor_volume(
 
     y_top = float(max(volumes.max(), threshold_line.max())) * 1.05
 
-    # Nadir marker(s) + label(s): the overall nadir, plus any earlier nadir
-    # that preceded a progression episode (each episode is measured against
-    # the nadir current at that point, which may not be the overall nadir).
+    # Overall nadir, plus any earlier nadir a progression episode was measured against.
     labeled_nadir_idxs = {episode["nadir_idx"] for episode in episodes} | {overall_nadir_idx}
     for nadir_idx in sorted(labeled_nadir_idxs):
         ax.plot(

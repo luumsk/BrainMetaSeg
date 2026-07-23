@@ -2,31 +2,18 @@
 """Pre-flight data-quality report for a folder of dated tumor segmentation files.
 
 Run this BEFORE tumor_tracking.py to surface issues that would otherwise
-silently produce wrong or low-confidence results: mismatched shapes, scans
-that aren't co-registered to each other, unexpected (non-binary) label
-values, empty masks, corrupt files, duplicate/unparsable timepoints, and
-unusually large gaps between visits.
+silently produce wrong results: mismatched shapes, scans that aren't
+co-registered, non-binary label values, empty masks, corrupt files,
+duplicate/unparsable timepoints, and unusually large gaps between visits.
 
-Expected input
---------------
-    seg_dir/
-        tumor_2021-03.nii.gz
-        tumor_2021-07.nii.gz
-        ...
-    (or "YYYY_MM" with underscores, e.g. flair_2021_03.nii.gz)
-Same file/date convention as tumor_tracking.py (override --filename-pattern
-if yours differs).
-
-Output
-------
-Writes two files next to --output-prefix:
-* <prefix>.csv -- one row per input file, all per-file diagnostics.
-* <prefix>.txt -- human-readable report: one section per file, one section
-  per consecutive-timepoint comparison, and a final summary.
+Expects "tumor_YYYY-MM.nii.gz"/"flair_YYYY_MM.nii.gz"-style filenames (same
+convention as tumor_tracking.py; override --filename-pattern if yours
+differs), and writes <prefix>.csv (one row per file) + <prefix>.txt
+(human-readable report) next to --output-prefix.
 
 Usage
 -----
-    python check_tumor_data.py --seg-dir /path/to/tumor_volume
+    python utils/check_tumor_data.py --seg-dir /path/to/tumor_volume
 """
 
 from __future__ import annotations
@@ -47,7 +34,7 @@ from scipy import ndimage
 logger = logging.getLogger("check_tumor_data")
 
 DEFAULT_FILENAME_PATTERN = r"(?P<date>\d{4}[-_]\d{2})\.nii\.gz$"
-DEFAULT_AFFINE_ATOL = 1e-2  # matches the tolerance tumor_tracking.py uses to decide co-registration
+DEFAULT_AFFINE_ATOL = 1e-2  # matches tumor_tracking.py's co-registration tolerance
 
 
 # --------------------------------------------------------------------------
@@ -453,17 +440,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--filename-pattern",
         default=DEFAULT_FILENAME_PATTERN,
-        help="Regex with a named group 'date' (YYYY-MM or YYYY_MM); should match tumor_tracking.py's setting",
+        help="Regex with a named group 'date'; should match tumor_tracking.py's setting",
     )
     parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=26)
-    parser.add_argument("--min-volume-mm3", type=float, default=8.0, help="Noise threshold; should match tumor_tracking.py's setting")
+    parser.add_argument("--min-volume-mm3", type=float, default=20.0, help="Noise threshold; should match tumor_tracking.py's setting")
     parser.add_argument(
         "--affine-atol",
         type=float,
         default=DEFAULT_AFFINE_ATOL,
-        help="Max per-element affine difference to still call two timepoints co-registered (matches tumor_tracking.py)",
+        help="Max per-element affine difference to still call two timepoints co-registered",
     )
-    parser.add_argument("--max-gap-days", type=float, default=400.0, help="Flag consecutive visits further apart than this many days")
+    parser.add_argument("--max-gap-days", type=float, default=400.0, help="Flag visits further apart than this many days")
     parser.add_argument(
         "--output-prefix",
         type=Path,

@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """Compute segmentation metrics (Dice, HD95, volume, instance count) between
-ground-truth and predicted masks -- without depending on a specialized
-third-party metrics package (no medpy, MONAI, SimpleITK, or seg-metrics).
+ground-truth and predicted masks, without a specialized third-party metrics
+package (no medpy, MONAI, SimpleITK, or seg-metrics) -- just numpy/scipy/nibabel.
 
-Dice, HD95, and instance counting are implemented directly in this file.
-I/O (nibabel) and generic array/morphology primitives (numpy, scipy.ndimage
-connected-components / distance-transform / erosion) are reused from this
-repo's own stack -- the same ones `tumor_tracking.py` already relies on --
-rather than a specialized metrics library computing the numbers for us.
-
-Ground truth is expected to be binary (a single "tumor" foreground class).
-If the matching prediction has multiple labels instead (e.g. 0/1/2/3 for
-background/necrotic/edema/enhancing), those labels are merged into one
-binary foreground before any metric is computed, so both sides are compared
-on equal footing. If the ground truth itself isn't binary, both sides are
-binarized on a whole-foreground basis instead -- a warning is logged either
-way so this never happens silently.
+Ground truth is expected to be binary (a single "tumor" class). If the
+matching prediction has multiple labels instead (e.g. 0/1/2/3 for
+background/necrotic/edema/enhancing), they're merged into one binary
+foreground before any metric is computed. If gt itself isn't binary, both
+sides are binarized on a whole-foreground basis instead -- logged either way.
 
 Usage
 -----
-    python compute_seg_metrics.py \\
+    python utils/compute_seg_metrics.py \\
         --gt-dir /data/patient1/ground_truth \\
         --seg-dir /data/patient1/segresnet_preds \\
         --output-csv /data/patient1/seg_metrics.csv
@@ -70,15 +62,7 @@ def load_nifti_raw(path: Path) -> tuple[np.ndarray, tuple[float, float, float], 
 def to_binary_masks(
     gt_raw: np.ndarray, seg_raw: np.ndarray, case_id: str
 ) -> tuple[np.ndarray, np.ndarray, list[int], list[int], bool]:
-    """Binarize gt/seg into comparable foreground masks.
-
-    Ground truth is expected to be a single binary "tumor" class. If it is,
-    but the prediction carries multiple labels (e.g. necrotic/edema/
-    enhancing sub-regions), those are merged into one binary foreground so
-    it can be compared against the binary gt. If gt itself isn't binary,
-    both sides are merged onto a whole-foreground basis instead -- every
-    metric below always operates on two boolean masks, never raw labels.
-    """
+    """Binarize gt/seg into comparable foreground masks, merging seg labels if gt is binary but seg isn't."""
     gt_labels = sorted(int(v) for v in np.unique(gt_raw))
     seg_labels = sorted(int(v) for v in np.unique(seg_raw))
 
@@ -107,22 +91,12 @@ def to_binary_masks(
 
 
 # --------------------------------------------------------------------------
-# Dice is reused as-is from tumor_tracking.dice_score:
-#   2 * |A ∩ B| / (|A| + |B|), with the empty-both-masks case returning 1.0.
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# HD95
+# HD95 (Dice is reused as-is from tumor_tracking.dice_score)
 # --------------------------------------------------------------------------
 
 
 def surface_voxels(mask: np.ndarray, structure: np.ndarray) -> np.ndarray:
-    """Boolean mask of foreground voxels that touch the background.
-
-    A voxel survives binary erosion only if every neighbor (per `structure`)
-    is also foreground, so `mask & ~eroded` is exactly the boundary shell.
-    """
+    """Boolean mask of foreground voxels that touch the background."""
     if not mask.any():
         return mask
     eroded = ndimage.binary_erosion(mask, structure=structure, border_value=0)
@@ -135,18 +109,10 @@ def hausdorff_distance_95mm(
     spacing: tuple[float, float, float],
     structure: np.ndarray,
 ) -> float:
-    """95th-percentile symmetric Hausdorff distance (mm) between two masks.
-
-    Standard segmentation-challenge definition: compute directed surface
-    distances in both directions (each surface point of one mask vs. the
-    nearest voxel of the other), take the 95th percentile of each direction,
-    then report the max of the two. This is far less sensitive to a single
-    outlier boundary voxel than the true (100th percentile) Hausdorff
-    distance, which is why it's the metric usually reported instead.
-
-    Returns NaN if exactly one mask is empty (distance is undefined -- there
-    is no "nearest voxel" on the empty side), and 0.0 if both are empty
-    (perfect agreement, nothing to disagree about).
+    """95th-percentile symmetric Hausdorff distance (mm): max of the two directed
+    95th-percentile surface distances -- robust to a single outlier voxel, unlike
+    the true (100th percentile) Hausdorff distance. NaN if only one mask is
+    empty (undefined), 0.0 if both are (perfect agreement).
     """
     a_empty, b_empty = not mask_a.any(), not mask_b.any()
     if a_empty and b_empty:
@@ -157,8 +123,6 @@ def hausdorff_distance_95mm(
     surf_a = surface_voxels(mask_a, structure)
     surf_b = surface_voxels(mask_b, structure)
 
-    # distance_transform_edt(~mask) gives, at every voxel, the Euclidean
-    # distance (mm, via `sampling`) to the nearest True voxel of `mask`.
     dist_to_a = ndimage.distance_transform_edt(~mask_a, sampling=spacing)
     dist_to_b = ndimage.distance_transform_edt(~mask_b, sampling=spacing)
 
@@ -230,13 +194,7 @@ def identical_gt_to_seg_filename(gt_filename: str) -> str:
 
 
 def braintracking_gt_to_seg_filename(gt_filename: str) -> str:
-    """Map a BrainTracking gt filename to its matching prediction filename.
-
-    BrainTracking ground truth is named e.g. "tumor_2016-11.nii.gz" while the
-    matching prediction for the same timepoint is named "flair_2016_11.nii.gz"
-    -- the prefix changes ("tumor_" -> "flair_") and the date separator
-    changes ("-" -> "_").
-    """
+    """Map gt "tumor_2016-11.nii.gz" to its matching seg "flair_2016_11.nii.gz"."""
     if gt_filename.endswith(".nii.gz"):
         stem, suffix = gt_filename[: -len(".nii.gz")], ".nii.gz"
     elif gt_filename.endswith(".nii"):
