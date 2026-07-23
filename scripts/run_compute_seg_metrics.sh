@@ -9,6 +9,7 @@ GT_DIR="path/to/ground_truth"
 SEG_DIR="path/to/segresnet_preds"
 OUTPUT_CSV="./seg_metrics.csv"
 PATTERN="*.nii.gz"                             # glob (relative to GT_DIR) for gt files to evaluate
+NAMING_SCHEME="identical"                      # identical, or braintracking (gt "tumor_2016-11.nii.gz" <-> seg "flair_2016_11.nii.gz")
 
 CONNECTIVITY=26                                # 6, 18, or 26 -- used for instance counting
 MIN_VOLUME_MM3=20                              # drop components smaller than this when counting instances (noise filter)
@@ -24,6 +25,7 @@ ARGS=(
   --seg-dir "$SEG_DIR"
   --output-csv "$OUTPUT_CSV"
   --pattern "$PATTERN"
+  --naming-scheme "$NAMING_SCHEME"
   --connectivity "$CONNECTIVITY"
   --min-volume-mm3 "$MIN_VOLUME_MM3"
   --log-level "$LOG_LEVEL"

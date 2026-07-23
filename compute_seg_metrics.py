@@ -220,18 +220,54 @@ def compute_case_metrics(case_id: str, gt_path: Path, seg_path: Path, settings: 
 
 
 # --------------------------------------------------------------------------
-# Discovery: match gt/seg files by identical filename
+# Discovery: match gt/seg files by filename, via a pluggable naming scheme
 # --------------------------------------------------------------------------
 
 
-def discover_pairs(gt_dir: Path, seg_dir: Path, pattern: str) -> list[tuple[str, Path, Path]]:
+def identical_gt_to_seg_filename(gt_filename: str) -> str:
+    """Default scheme: seg file has the exact same filename as gt."""
+    return gt_filename
+
+
+def braintracking_gt_to_seg_filename(gt_filename: str) -> str:
+    """Map a BrainTracking gt filename to its matching prediction filename.
+
+    BrainTracking ground truth is named e.g. "tumor_2016-11.nii.gz" while the
+    matching prediction for the same timepoint is named "flair_2016_11.nii.gz"
+    -- the prefix changes ("tumor_" -> "flair_") and the date separator
+    changes ("-" -> "_").
+    """
+    if gt_filename.endswith(".nii.gz"):
+        stem, suffix = gt_filename[: -len(".nii.gz")], ".nii.gz"
+    elif gt_filename.endswith(".nii"):
+        stem, suffix = gt_filename[: -len(".nii")], ".nii"
+    else:
+        raise ValueError(f"Not a NIfTI filename: {gt_filename!r}")
+
+    gt_prefix = "tumor_"
+    if not stem.startswith(gt_prefix):
+        raise ValueError(f"Expected gt filename to start with '{gt_prefix}', got {gt_filename!r}")
+
+    date_part = stem[len(gt_prefix):].replace("-", "_")
+    return f"flair_{date_part}{suffix}"
+
+
+NAMING_SCHEMES = {
+    "identical": identical_gt_to_seg_filename,
+    "braintracking": braintracking_gt_to_seg_filename,
+}
+
+
+def discover_pairs(gt_dir: Path, seg_dir: Path, pattern: str, naming_scheme: str = "identical") -> list[tuple[str, Path, Path]]:
     gt_files = sorted(gt_dir.glob(pattern))
     if not gt_files:
         raise FileNotFoundError(f"No files matching '{pattern}' found in {gt_dir}")
 
+    map_gt_to_seg_filename = NAMING_SCHEMES[naming_scheme]
+
     pairs = []
     for gt_path in gt_files:
-        seg_path = seg_dir / gt_path.name
+        seg_path = seg_dir / map_gt_to_seg_filename(gt_path.name)
         if not seg_path.is_file():
             logger.warning("%s: no matching seg file at %s -- skipping", gt_path.name, seg_path)
             continue
@@ -249,8 +285,15 @@ def discover_pairs(gt_dir: Path, seg_dir: Path, pattern: str) -> list[tuple[str,
 # --------------------------------------------------------------------------
 
 
-def run(gt_dir: Path, seg_dir: Path, output_csv: Path, pattern: str, settings: MetricSettings) -> pd.DataFrame:
-    pairs = discover_pairs(gt_dir, seg_dir, pattern)
+def run(
+    gt_dir: Path,
+    seg_dir: Path,
+    output_csv: Path,
+    pattern: str,
+    settings: MetricSettings,
+    naming_scheme: str = "identical",
+) -> pd.DataFrame:
+    pairs = discover_pairs(gt_dir, seg_dir, pattern, naming_scheme)
     logger.info("Found %d matched gt/seg case(s)", len(pairs))
 
     rows = []
@@ -297,6 +340,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seg-dir", required=True, type=Path, help="Folder of predicted masks, matched to gt files by identical filename")
     parser.add_argument("--output-csv", required=True, type=Path, help="Path to write the per-case metrics CSV")
     parser.add_argument("--pattern", default="*.nii.gz", help="Glob pattern (relative to --gt-dir) for ground-truth files to evaluate")
+    parser.add_argument(
+        "--naming-scheme",
+        choices=list(NAMING_SCHEMES),
+        default="identical",
+        help="How to map a gt filename to its matching seg filename. 'identical': same filename in both dirs. "
+        "'braintracking': gt 'tumor_2016-11.nii.gz' <-> seg 'flair_2016_11.nii.gz'",
+    )
 
     parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=26, help="Connectivity used for instance counting")
     parser.add_argument("--min-volume-mm3", type=float, default=20.0, help="Drop components smaller than this when counting instances (noise filter)")
@@ -318,6 +368,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         output_csv=args.output_csv,
         pattern=args.pattern,
         settings=settings,
+        naming_scheme=args.naming_scheme,
     )
 
 
