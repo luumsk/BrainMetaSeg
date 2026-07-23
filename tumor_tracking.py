@@ -30,6 +30,10 @@ What this does now
 3. Measures volume (+ basic centroid/bbox geometry) per instance per
    timepoint and writes one long-format CSV, ready to group by `tumor_id` and
    plot volume vs. date.
+4. Flags tracks that only ever appear at one timepoint via
+   `is_single_timepoint_track` -- a stronger noise signal than volume alone,
+   since a real small/early lesion can be the same size as a segmentation
+   noise blob. Pass `--drop-single-timepoint-tracks` to remove them outright.
 
 Extension points (not implemented yet, by design)
 --------------------------------------------------
@@ -74,7 +78,7 @@ DEFAULT_FILENAME_PATTERN = r"(?P<date>\d{4}[-_]\d{2})\.nii\.gz$"
 @dataclass
 class Settings:
     connectivity: int = 26
-    min_volume_mm3: float = 8.0
+    min_volume_mm3: float = 20.0
     match_centroid_threshold_mm: float = 10.0
     match_surface_threshold_mm: float = 5.0
 
@@ -456,6 +460,27 @@ def add_growth_columns(df: pd.DataFrame, dates: dict[str, pd.Timestamp]) -> pd.D
 
 
 # --------------------------------------------------------------------------
+# Persistence (a much stronger noise signal than volume, since real small/
+# early lesions can be the same size as segmentation-noise blobs)
+# --------------------------------------------------------------------------
+
+
+def add_persistence_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag tumor instances that only ever appear at one timepoint.
+
+    A component that never recurs at the next scan is far more likely to be
+    an isolated false-positive blob than a real lesion -- real tumors persist
+    or at least get re-checked at the next visit, whereas a volume threshold
+    alone can't tell a real small/early lesion apart from a noise blob of the
+    same size.
+    """
+    df = df.copy()
+    df["track_length"] = df.groupby("tumor_id")["tumor_id"].transform("size")
+    df["is_single_timepoint_track"] = df["track_length"] == 1
+    return df
+
+
+# --------------------------------------------------------------------------
 # Pipeline
 # --------------------------------------------------------------------------
 
@@ -468,6 +493,7 @@ def run(
     settings: Settings,
     save_cc_maps: bool,
     cc_maps_dir: Path,
+    drop_single_timepoint_tracks: bool = False,
 ) -> pd.DataFrame:
     timepoints = discover_timepoints(seg_dir, filename_pattern)
     logger.info("Found %d timepoints in %s", len(timepoints), seg_dir)
@@ -518,6 +544,14 @@ def run(
 
     merged = tracks_df.merge(metrics_long, on=["timepoint", "component_id"], how="left")
     merged = add_growth_columns(merged, dates)
+    merged = add_persistence_columns(merged)
+
+    if drop_single_timepoint_tracks:
+        n_before = merged["tumor_id"].nunique()
+        merged = merged[~merged["is_single_timepoint_track"]].reset_index(drop=True)
+        n_after = merged["tumor_id"].nunique()
+        logger.info("Dropped %d single-timepoint tracks (likely noise)", n_before - n_after)
+
     merged.insert(0, "date", merged["timepoint"].map(dates))
     merged.insert(0, "patient_id", patient_id)
     merged = merged.sort_values(["tumor_id", "date"]).reset_index(drop=True)
@@ -549,9 +583,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--connectivity", type=int, choices=[6, 18, 26], default=26)
-    parser.add_argument("--min-volume-mm3", type=float, default=8.0, help="Drop components smaller than this (filters segmentation noise)")
+    parser.add_argument("--min-volume-mm3", type=float, default=20.0, help="Drop components smaller than this (filters segmentation noise)")
     parser.add_argument("--match-centroid-threshold-mm", type=float, default=10.0, help="Max centroid distance to consider two tumors a candidate match")
     parser.add_argument("--match-surface-threshold-mm", type=float, default=5.0, help="Max surface-to-surface distance to consider two tumors a candidate match")
+    parser.add_argument(
+        "--drop-single-timepoint-tracks",
+        action="store_true",
+        help=(
+            "Remove tumor instances that only ever appear at one timepoint across the whole "
+            "study (a much stronger noise signal than volume alone -- real lesions persist or "
+            "get re-checked at the next visit). Rows are always tagged via 'is_single_timepoint_track' "
+            "regardless of this flag; this just controls whether they're dropped before writing the CSV."
+        ),
+    )
 
     parser.add_argument(
         "--save-cc-maps",
@@ -592,6 +636,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         settings=settings,
         save_cc_maps=args.save_cc_maps,
         cc_maps_dir=cc_maps_dir,
+        drop_single_timepoint_tracks=args.drop_single_timepoint_tracks,
     )
 
 

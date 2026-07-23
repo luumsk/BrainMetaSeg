@@ -11,9 +11,10 @@ PATIENT_ID=""
 FILENAME_PATTERN='(?P<date>\d{4}[-_]\d{2})\.nii\.gz$'   # matches YYYY-MM or YYYY_MM before .nii.gz
 
 CONNECTIVITY=26                                # 6, 18, or 26
-MIN_VOLUME_MM3=8                               # drop components smaller than this (noise filter)
+MIN_VOLUME_MM3=20                              # drop components smaller than this (noise filter)
 MATCH_CENTROID_THRESHOLD_MM=10
 MATCH_SURFACE_THRESHOLD_MM=5
+DROP_SINGLE_TIMEPOINT_TRACKS=false              # true/false -- drop tumor instances that only ever appear at one timepoint (likely noise)
 
 SAVE_CC_MAPS=true                              # true/false -- persist labeled component maps per timepoint
 CC_MAPS_DIR=""                                 # empty -> defaults next to OUTPUT_CSV
@@ -37,6 +38,10 @@ ARGS=(
 
 if [ -n "$PATIENT_ID" ]; then
   ARGS+=(--patient-id "$PATIENT_ID")
+fi
+
+if [ "$DROP_SINGLE_TIMEPOINT_TRACKS" = true ]; then
+  ARGS+=(--drop-single-timepoint-tracks)
 fi
 
 if [ "$SAVE_CC_MAPS" = true ]; then
