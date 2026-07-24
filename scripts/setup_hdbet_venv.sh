@@ -16,7 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-HDBET_VENV_DIR="$REPO_ROOT/hdbet_venv"
+HDBET_VENV_DIR="/media/storage/luu/hdbet_venv"
 
 python3 -m venv "$HDBET_VENV_DIR"
 "$HDBET_VENV_DIR/bin/pip" install --upgrade pip
