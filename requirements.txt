@@ -7,6 +7,7 @@ scipy==1.14.1
 matplotlib==3.9.2
 pandas==2.2.2
 segmentationmetrics==1.1.1
+antspyx==0.6.3
 
 
 

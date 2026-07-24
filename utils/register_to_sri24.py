@@ -51,25 +51,22 @@ Usage
         --input-dir /data/patient1/raw \\
         --output-dir /data/patient1/sri24
 
-Extension point (not implemented here, by design)
---------------------------------------------------
-To warp a companion file (e.g. a tumor segmentation mask) with the exact
-same transform computed for its scan, reuse the saved transforms with a
-label-preserving interpolator instead of recomputing registration:
+Registering ground-truth labels alongside their scans
+-------------------------------------------------------
+Pass --labels-dir to also carry each scan's matching label/segmentation file
+through the exact same transform computed for that scan -- using a
+label-preserving interpolator ("genericLabel") regardless of --interpolator,
+so mask values stay crisp instead of blurring like an intensity image would.
+A scan with no matching label is still registered normally; only the label
+step is skipped for it. --labels-naming-scheme controls how a label
+filename is derived from its scan's filename ("identical", or
+"braintracking" for this repo's flair_YYYY_MM.nii.gz <-> tumor_YYYY-MM.nii.gz
+convention -- see compute_seg_metrics.py's naming schemes, same idea,
+opposite direction).
 
-    import ants, json
-    from pathlib import Path
-
-    case_dir = Path("sri24_transforms/<case>")
-    names = json.loads((case_dir / "fwdtransforms.json").read_text())
-    fwdtransforms = [str(case_dir / n) for n in names]
-
-    warped_seg = ants.apply_transforms(
-        fixed=ants.image_read("templates/sri24/spgr.nii.gz"),
-        moving=ants.image_read("<path/to/seg.nii.gz>"),
-        transformlist=fwdtransforms,
-        interpolator="genericLabel",  # mode-based, keeps mask labels crisp
-    )
+    python utils/register_to_sri24.py \\
+        --input-dir nifti_native --output-dir registered \\
+        --labels-dir tumor_volume --labels-naming-scheme braintracking
 """
 
 from __future__ import annotations
@@ -130,6 +127,10 @@ class RegistrationResult:
     output_shape: tuple = ()
     output_spacing: tuple = ()
     transforms_dir: str = ""
+    label_input_path: Optional[Path] = None
+    label_output_path: Optional[Path] = None
+    label_status: str = ""  # "", "ok", "not_found", "failed"
+    label_error: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -195,6 +196,35 @@ def strip_nifti_suffix(name: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Scan -> label filename mapping (inverse of compute_seg_metrics.py's
+# gt_to_seg naming schemes, since here the scan drives discovery)
+# --------------------------------------------------------------------------
+
+
+def identical_scan_to_label_filename(scan_filename: str) -> str:
+    return scan_filename
+
+
+def braintracking_scan_to_label_filename(scan_filename: str) -> str:
+    """Map scan "flair_2016_11.nii.gz" to its matching label "tumor_2016-11.nii.gz"."""
+    stem = strip_nifti_suffix(scan_filename)
+    suffix = scan_filename[len(stem):]
+
+    scan_prefix = "flair_"
+    if not stem.startswith(scan_prefix):
+        raise ValueError(f"Expected scan filename to start with '{scan_prefix}', got {scan_filename!r}")
+
+    date_part = stem[len(scan_prefix):].replace("_", "-")
+    return f"tumor_{date_part}{suffix}"
+
+
+LABEL_NAMING_SCHEMES = {
+    "identical": identical_scan_to_label_filename,
+    "braintracking": braintracking_scan_to_label_filename,
+}
+
+
+# --------------------------------------------------------------------------
 # Transforms
 # --------------------------------------------------------------------------
 
@@ -230,6 +260,8 @@ def register_one(
     output_path: Path,
     transforms_dir: Optional[Path],
     settings: RegistrationSettings,
+    label_path: Optional[Path] = None,
+    label_output_path: Optional[Path] = None,
 ) -> RegistrationResult:
     result = RegistrationResult(
         case=case,
@@ -238,6 +270,8 @@ def register_one(
         transform_type=settings.transform_type,
         n4_correct=settings.n4_correct,
         interpolator=settings.interpolator,
+        label_input_path=label_path,
+        label_status="not_found" if label_path is None else "",
     )
     t0 = time.time()
     try:
@@ -265,6 +299,29 @@ def register_one(
         if transforms_dir is not None:
             saved_dir = save_transforms(reg["fwdtransforms"], transforms_dir / case)
             result.transforms_dir = str(saved_dir)
+
+        if label_path is not None:
+            try:
+                label_img = ants.image_read(str(label_path))
+                # Always label-preserving here, independent of --interpolator
+                # (which governs the intensity image above): "genericLabel"
+                # is a majority-vote resample that keeps discrete label
+                # values crisp instead of blurring them like linear/bSpline
+                # would.
+                warped_label = ants.apply_transforms(
+                    fixed=fixed_img,
+                    moving=label_img,
+                    transformlist=reg["fwdtransforms"],
+                    interpolator="genericLabel",
+                )
+                label_output_path.parent.mkdir(parents=True, exist_ok=True)
+                ants.image_write(warped_label, str(label_output_path))
+                result.label_output_path = label_output_path
+                result.label_status = "ok"
+            except Exception as label_exc:
+                result.label_status = "failed"
+                result.label_error = str(label_exc)
+                logger.error("%s: label registration failed -- %s", case, label_exc)
 
     except Exception as exc:  # one bad scan shouldn't kill the whole batch
         result.status = "failed"
@@ -294,6 +351,9 @@ def run(
     transforms_dir: Optional[Path],
     manifest_csv: Path,
     overwrite: bool,
+    labels_dir: Optional[Path] = None,
+    labels_output_dir: Optional[Path] = None,
+    labels_naming_scheme: str = "identical",
 ) -> pd.DataFrame:
     fixed_path = ensure_template(template_channel, template_path, template_cache_dir)
     logger.info("Using SRI24 '%s' template: %s", template_channel, fixed_path)
@@ -301,6 +361,9 @@ def run(
 
     scans = discover_scans(input_dir, pattern, recursive)
     logger.info("Found %d scan(s) in %s", len(scans), input_dir)
+    if labels_dir is not None:
+        logger.info("Also registering matching labels from %s (naming scheme: %s)", labels_dir, labels_naming_scheme)
+        map_scan_to_label = LABEL_NAMING_SCHEMES[labels_naming_scheme]
 
     results = []
     for i, scan_path in enumerate(scans, start=1):
@@ -308,6 +371,20 @@ def run(
         case = str((rel_path.parent / strip_nifti_suffix(scan_path.name)).as_posix())
         out_name = f"{strip_nifti_suffix(scan_path.name)}{output_suffix}.nii.gz"
         output_path = output_dir / rel_path.parent / out_name
+
+        label_path = None
+        label_output_path = None
+        if labels_dir is not None:
+            try:
+                label_filename = map_scan_to_label(scan_path.name)
+                candidate = labels_dir / label_filename
+                if candidate.is_file():
+                    label_path = candidate
+                    label_output_path = labels_output_dir / label_filename
+                else:
+                    logger.info("%s: no matching label at %s -- registering scan only", case, candidate)
+            except ValueError as exc:
+                logger.warning("%s: could not derive label filename -- %s", case, exc)
 
         if output_path.exists() and not overwrite:
             logger.info("[%d/%d] %s: output already exists, skipping (--overwrite to redo)", i, len(scans), case)
@@ -321,12 +398,17 @@ def run(
                     transform_type=settings.transform_type,
                     n4_correct=settings.n4_correct,
                     interpolator=settings.interpolator,
+                    label_input_path=label_path,
+                    label_status="skipped" if label_path is not None else "",
                 )
             )
             continue
 
         logger.info("[%d/%d] %s: registering", i, len(scans), case)
-        result = register_one(scan_path, case, fixed_img, template_channel, output_path, transforms_dir, settings)
+        result = register_one(
+            scan_path, case, fixed_img, template_channel, output_path, transforms_dir, settings,
+            label_path=label_path, label_output_path=label_output_path,
+        )
         results.append(result)
 
     manifest_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -336,7 +418,13 @@ def run(
     n_ok = int((df["status"] == "ok").sum())
     n_failed = int((df["status"] == "failed").sum())
     n_skipped = int((df["status"] == "skipped").sum())
-    logger.info("Done: %d ok, %d failed, %d skipped. Manifest: %s", n_ok, n_failed, n_skipped, manifest_csv)
+    msg = f"Done: {n_ok} ok, {n_failed} failed, {n_skipped} skipped."
+    if labels_dir is not None:
+        n_label_ok = int((df["label_status"] == "ok").sum())
+        n_label_failed = int((df["label_status"] == "failed").sum())
+        n_label_missing = int((df["label_status"] == "not_found").sum())
+        msg += f" Labels: {n_label_ok} ok, {n_label_failed} failed, {n_label_missing} had no match."
+    logger.info("%s Manifest: %s", msg, manifest_csv)
 
     return df
 
@@ -426,6 +514,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to write the per-scan registration manifest CSV (defaults next to --output-dir)",
     )
 
+    parser.add_argument(
+        "--labels-dir",
+        type=Path,
+        default=None,
+        help="Folder of ground-truth label/segmentation files to carry through the same per-scan transform "
+        "(always uses a label-preserving interpolator, independent of --interpolator)",
+    )
+    parser.add_argument(
+        "--labels-output-dir",
+        type=Path,
+        default=None,
+        help="Where registered labels are written if --labels-dir is set (default: 'registered_labels' next to --output-dir)",
+    )
+    parser.add_argument(
+        "--labels-naming-scheme",
+        choices=sorted(LABEL_NAMING_SCHEMES),
+        default="identical",
+        help="How to derive a label filename from its scan's filename: 'identical' (same name), or "
+        "'braintracking' (scan 'flair_2016_11.nii.gz' -> label 'tumor_2016-11.nii.gz')",
+    )
+
     parser.add_argument("--overwrite", action="store_true", help="Re-register and overwrite scans that already have an output file")
     parser.add_argument(
         "--download-only",
@@ -458,6 +567,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     transforms_dir = args.transforms_dir or (args.output_dir.parent / "sri24_transforms")
     manifest_csv = args.manifest_csv or (args.output_dir.parent / "sri24_registration_manifest.csv")
+    labels_output_dir = args.labels_output_dir or (args.output_dir.parent / "registered_labels")
 
     run(
         input_dir=args.input_dir,
@@ -472,6 +582,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         transforms_dir=transforms_dir if args.save_transforms else None,
         manifest_csv=manifest_csv,
         overwrite=args.overwrite,
+        labels_dir=args.labels_dir,
+        labels_output_dir=labels_output_dir if args.labels_dir else None,
+        labels_naming_scheme=args.labels_naming_scheme,
     )
 
 

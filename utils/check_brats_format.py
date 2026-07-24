@@ -11,7 +11,16 @@ actually need to fix before inference, for ANY input folder -- just point
 
 Reference values (BRATS_REFERENCE_* below) come directly from this repo's
 cached SRI24 template (see register_to_sri24.py), not from a spec doc:
-* shape/spacing/orientation: read off templates/sri24/spgr.nii.gz
+* shape/spacing: read off templates/sri24/spgr.nii.gz -- identical across
+  every SRI24 channel, so these don't depend on --template-channel.
+* orientation: read off whichever --template-channel file is cached (default
+  spgr). This matters because spgr.nii.gz and spgr_unstrip.nii.gz disagree
+  on L/R sign in their headers (LAS vs RAS) despite sharing the same
+  physical atlas space -- pass --template-channel spgr_unstrip if that's
+  what you register to (e.g. skull-on private scans), or you'll get a
+  spurious orientation mismatch. Note orientation is informational only --
+  it is NOT part of matches_brats_format below, since ants.registration
+  works from the full affine, not the axcode label.
 * skull-stripped threshold: spgr.nii.gz (skull-stripped) is ~16% nonzero
   voxels, spgr_unstrip.nii.gz (skull-on) is ~77% -- 40% is the cutoff
   between them. It's a heuristic (a small/necrotic brain or a very tight
@@ -49,8 +58,33 @@ logger = logging.getLogger("check_brats_format")
 # Derived from templates/sri24/spgr.nii.gz -- see module docstring.
 BRATS_REFERENCE_SHAPE = (240, 240, 155)
 BRATS_REFERENCE_SPACING_MM = (1.0, 1.0, 1.0)
-BRATS_REFERENCE_ORIENTATION = "LAS"
+BRATS_REFERENCE_ORIENTATION_FALLBACK = "LAS"  # used only if --template-channel isn't cached locally
 DEFAULT_SKULL_STRIPPED_NONZERO_THRESHOLD = 0.40
+
+# Same channel->filename mapping as register_to_sri24.py's SRI24_CHANNELS,
+# duplicated here (not imported) to avoid pulling in antspyx just for this
+# dict -- this script stays dependency-light on purpose.
+SRI24_CHANNEL_FILES = {
+    "spgr": "spgr.nii.gz",
+    "spgr_unstrip": "spgr_unstrip.nii.gz",
+    "erly": "erly.nii.gz",
+    "late": "late.nii.gz",
+}
+DEFAULT_TEMPLATE_CACHE_DIR = Path(__file__).resolve().parent.parent / "templates" / "sri24"
+
+
+def resolve_reference_orientation(template_channel: str, template_cache_dir: Path) -> str:
+    template_path = template_cache_dir / SRI24_CHANNEL_FILES[template_channel]
+    if template_path.is_file():
+        return "".join(nib.aff2axcodes(nib.load(str(template_path)).affine))
+    logger.warning(
+        "%s not cached locally (run register_to_sri24.py --download-only --template-channel %s) -- "
+        "falling back to the spgr-derived orientation reference '%s', which may not match this channel",
+        template_path,
+        template_channel,
+        BRATS_REFERENCE_ORIENTATION_FALLBACK,
+    )
+    return BRATS_REFERENCE_ORIENTATION_FALLBACK
 
 REQUIRED_MODALITIES = ["T1", "T1c", "T2", "FLAIR"]
 # Checked in this order -- "t1c"/"t2f" are substrings of naive "t1"/"t2"
@@ -112,7 +146,7 @@ class FileReport:
         )
 
 
-def inspect_file(path: Path, skull_stripped_threshold: float) -> FileReport:
+def inspect_file(path: Path, skull_stripped_threshold: float, reference_orientation: str) -> FileReport:
     report = FileReport(path=path, modality=guess_modality(path.name))
 
     try:
@@ -138,7 +172,7 @@ def inspect_file(path: Path, skull_stripped_threshold: float) -> FileReport:
 
     report.matches_brats_shape = shape == BRATS_REFERENCE_SHAPE
     report.matches_brats_spacing = all(abs(s - r) <= 0.05 for s, r in zip(spacing, BRATS_REFERENCE_SPACING_MM))
-    report.matches_brats_orientation = report.orientation == BRATS_REFERENCE_ORIENTATION
+    report.matches_brats_orientation = report.orientation == reference_orientation
 
     if report.modality == "unknown":
         report.issues.append("Could not guess modality (T1/T1c/T2/FLAIR) from filename")
@@ -158,7 +192,7 @@ def inspect_file(path: Path, skull_stripped_threshold: float) -> FileReport:
             f"threshold {skull_stripped_threshold:.0%})"
         )
     if not report.matches_brats_orientation:
-        report.issues.append(f"Orientation {report.orientation} != BraTS/SRI24 reference {BRATS_REFERENCE_ORIENTATION}")
+        report.issues.append(f"Orientation {report.orientation} != BraTS/SRI24 reference {reference_orientation}")
 
     return report
 
@@ -199,6 +233,8 @@ def format_report_text(
     input_dir: Path,
     file_reports: list[FileReport],
     skull_stripped_threshold: float,
+    reference_orientation: str,
+    template_channel: str,
 ) -> str:
     lines = []
     lines.append("BraTS/SRI24 FORMAT COMPLIANCE REPORT")
@@ -207,8 +243,8 @@ def format_report_text(
     lines.append(f"Files found: {len(file_reports)}")
     lines.append(
         f"BraTS/SRI24 reference: shape={BRATS_REFERENCE_SHAPE}, spacing={BRATS_REFERENCE_SPACING_MM}mm, "
-        f"orientation={BRATS_REFERENCE_ORIENTATION}, skull-stripped-nonzero-threshold={skull_stripped_threshold:.0%} "
-        "(all read off templates/sri24/spgr.nii.gz)"
+        f"orientation={reference_orientation} (--template-channel {template_channel}), "
+        f"skull-stripped-nonzero-threshold={skull_stripped_threshold:.0%}"
     )
     lines.append("")
 
@@ -303,11 +339,15 @@ def run(
     recursive: bool,
     skull_stripped_threshold: float,
     output_prefix: Path,
+    template_channel: str = "spgr",
+    template_cache_dir: Path = DEFAULT_TEMPLATE_CACHE_DIR,
 ) -> tuple[Path, Path]:
+    reference_orientation = resolve_reference_orientation(template_channel, template_cache_dir)
+
     paths = discover_scans(input_dir, pattern, recursive)
     logger.info("Found %d file(s) in %s", len(paths), input_dir)
 
-    file_reports = [inspect_file(path, skull_stripped_threshold) for path in paths]
+    file_reports = [inspect_file(path, skull_stripped_threshold, reference_orientation) for path in paths]
 
     for r in file_reports:
         if r.issues:
@@ -318,7 +358,9 @@ def run(
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     build_csv_rows(file_reports).to_csv(csv_path, index=False)
-    txt_path.write_text(format_report_text(input_dir, file_reports, skull_stripped_threshold))
+    txt_path.write_text(
+        format_report_text(input_dir, file_reports, skull_stripped_threshold, reference_orientation, template_channel)
+    )
 
     return csv_path, txt_path
 
@@ -348,6 +390,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Nonzero-voxel-fraction cutoff below which a scan is called skull-stripped (see module docstring for how this was derived)",
     )
     parser.add_argument(
+        "--template-channel",
+        choices=sorted(SRI24_CHANNEL_FILES),
+        default="spgr",
+        help="Which cached SRI24 channel to read the orientation reference from -- must match whatever "
+        "--template-channel you register to (see module docstring: spgr and spgr_unstrip disagree on L/R sign)",
+    )
+    parser.add_argument(
+        "--template-cache-dir",
+        type=Path,
+        default=DEFAULT_TEMPLATE_CACHE_DIR,
+        help="Where SRI24 template channels are cached (see register_to_sri24.py)",
+    )
+    parser.add_argument(
         "--output-prefix",
         type=Path,
         default=None,
@@ -370,6 +425,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         recursive=args.recursive,
         skull_stripped_threshold=args.skull_stripped_nonzero_threshold,
         output_prefix=output_prefix,
+        template_channel=args.template_channel,
+        template_cache_dir=args.template_cache_dir,
     )
     logger.info("Wrote %s", csv_path)
     logger.info("Wrote %s", txt_path)
