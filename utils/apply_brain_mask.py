@@ -69,6 +69,20 @@ def discover_labels(labels_dir: Path, pattern: str, recursive: bool) -> list[Pat
     return paths
 
 
+def mask_image(image_path: Path, mask_path: Path, output_path: Path) -> None:
+    """Zero out an intensity image outside a shared brain mask (float-preserving
+    sibling of apply_mask_to_label, for reusing one modality's HD-BET mask on
+    another modality of the same case rather than a label)."""
+    image = nib.load(str(image_path))
+    mask_data = np.asarray(nib.load(str(mask_path)).dataobj)
+    data = np.asarray(image.dataobj)
+    if data.shape != mask_data.shape:
+        raise ValueError(f"Shape mismatch: image {data.shape} vs mask {mask_data.shape} -- not on the same grid")
+    masked = np.where(mask_data > 0, data, 0).astype(data.dtype)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(masked, image.affine, image.header), str(output_path))
+
+
 def apply_mask_to_label(label_path: Path, mask_path: Path, output_path: Path) -> MaskResult:
     result = MaskResult(label=label_path.name, label_path=label_path, mask_path=mask_path)
     try:

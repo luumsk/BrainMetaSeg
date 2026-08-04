@@ -1,80 +1,60 @@
 #!/usr/bin/env python3
-"""Single-entry-point BraTS-like preprocessing pipeline: one input folder in,
-one output folder out.
+"""BraTS-matched multi-modality preprocessing: one input folder in, one
+nnU-Net-ready output folder out.
 
-Runs the standard BraTS preprocessing steps, each independently toggleable:
-    1. N4 bias field correction        (--n4-correct)
-    2. Rigid co-registration to SRI24  (--register)      -- also produces
-       isotropic 1mm spacing as a side effect, since the SRI24 template
-       itself is the 1mm grid being registered onto (see register_to_sri24.py
-       for why this is one step, not two, in the standard pipeline).
-    3. Standalone isotropic resample   (--resample)       -- only takes
-       effect if --no-register is set; otherwise step 2 already produced
-       isotropic spacing and this is a no-op (added deliberately so you
-       still get one flag per BraTS step, without double-resampling).
-    4. Skull-stripping (HD-BET)        (--skull-strip)
-    5. Z-score intensity normalization (--normalize)      -- computed from
-       brain-tissue voxels only (the mask from step 4, or a nonzero-voxel
-       approximation if skull-stripping was skipped), background forced to
-       exactly 0.
-Ground-truth labels (--labels-dir) ride along through steps 2/3 (a
-label-preserving interpolator, never blurred like the image) and get the
-same brain mask applied in step 4/5 -- HD-BET itself only ever sees images,
-never labels, since it's a network trained on MRI contrast.
+Each timepoint's 4 modalities (T1, T1c, T2, FLAIR) are processed as one
+group, not as independent files:
+    1. N4 bias field correction (--n4-correct), per modality.
+    2. Intra-subject co-registration: every modality is rigid-registered to
+       ONE reference modality per timepoint, chosen by BraTS priority
+       T1 > T2 > T1c > FLAIR (REFERENCE_PRIORITY below).
+    3. Atlas registration (--register): the reference (carrying the other
+       3 modalities via a single composed transform each -- one resample,
+       not two) is rigid-registered to SRI24. This is what makes all 4
+       modalities of a timepoint land on the exact same grid.
+    4. Skull-stripping (HD-BET) runs ONCE per timepoint, on the atlas-space
+       reference image only. The resulting mask is reused (not
+       recomputed) for the other 3 modalities.
+    5. Z-score intensity normalization (--normalize), per modality, within
+       the shared brain mask.
+A single ground-truth label (--labels-dir) rides along through the SAME
+composed transform as its host modality (FLAIR, via the "braintracking"
+naming scheme) and gets masked with the same shared brain mask.
 
 Step 4 needs its own venv (nnunetv2 version conflict with this repo's own
 fork -- see setup_hdbet_venv.sh) so this script shells out to it as a
 subprocess for that one step; everything else runs in-process here.
 
-After processing, a verification pass (--verify, on by default) re-loads
-every saved output file from disk and independently re-derives shape,
-spacing, orientation, skull-strip status, and normalization statistics --
-rather than re-trusting the values already computed during processing. This
-is deliberate: it's exactly how a real bug got caught during development
-(the report briefly mislabeled pre-normalization stats as post-normalization
-ones -- the processing itself was correct, but nothing during processing
-would have caught the report being wrong). Also checks that each label
-shares its image's exact grid and stayed discrete (no interpolation
-corruption).
-
-Modality completeness (T1/T1c/T2/FLAIR) is intentionally NOT checked or
-enforced here -- see check_brats_format.py if you need that; this pipeline
-processes whatever's in --input-dir regardless of which/how many
-modalities are present.
-
-Output layout
--------------
+Output is written directly in nnU-Net's raw-dataset convention:
     output_dir/
-        images/...                  final preprocessed scans (mirrors
-                                     --input-dir's subfolder structure)
-        labels/...                  final preprocessed labels, if
-                                     --labels-dir was given
-        masks/...                   brain masks, if --skull-strip ran
-        transforms/<case>/...       saved registration transforms, if
-                                     --register and --save-transforms
-        preprocess_report.csv       one row per case: status, timing,
-                                     shapes/spacings, brain intensity stats
-        preprocess_report.txt       same, human-readable, per case
-        preprocess_summary.txt      aggregate-only summary (counts, which
-                                     steps ran, distinct shapes/spacings)
-        verification_report.csv/.txt  independent post-hoc check of the
-                                     saved outputs (see above), if --verify
+        imagesTr/<case_id>_<CCCC>.nii.gz   CCCC = NNUNET_CHANNEL_INDEX below
+        labelsTr/<case_id>.nii.gz          if a label was found for that case
+        dataset.json                       nnU-Net dataset descriptor, written
+                                            if --labels-dir was given
+        masks/<case_id>_mask.nii.gz        shared brain mask (QC/audit only)
+        transforms/<case_id>/...           saved transforms, if
+                                            --register and --save-transforms
+        preprocess_report.csv/.txt         one row per output file
+        preprocess_summary.txt             aggregate-only summary
+        verification_report.csv/.txt       independent post-hoc check of the
+                                            saved outputs, if --verify
 
 Usage
 -----
     python utils/preprocess_brats.py \\
-        --input-dir nifti_native --output-dir brats_preprocessed \\
+        --input-dir nifti_native_4modalities --output-dir brats_preprocessed \\
         --labels-dir tumor_volume --labels-naming-scheme braintracking
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -83,11 +63,12 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 
-from apply_brain_mask import apply_mask_to_label
+from apply_brain_mask import apply_mask_to_label, mask_image
 from check_brats_format import (
     BRATS_REFERENCE_SHAPE,
     BRATS_REFERENCE_SPACING_MM,
     DEFAULT_SKULL_STRIPPED_NONZERO_THRESHOLD,
+    guess_modality,
     resolve_reference_orientation,
 )
 from register_to_sri24 import (
@@ -106,6 +87,29 @@ logger = logging.getLogger("preprocess_brats")
 INTERP_CODES = {"linear": 0, "nearestNeighbor": 1, "bSpline": 4}  # ants.resample_image's interp_type
 MASK_SUFFIX = "_bet.nii.gz"  # HD-BET's own convention for --save_bet_mask output
 
+# BraTS intra-subject co-registration reference priority (T1w > T2w > T1Gd >
+# FLAIR) -- the first of these present in a timepoint is the modality every
+# other modality of that timepoint is registered to.
+REFERENCE_PRIORITY = ["T1", "T2", "T1c", "FLAIR"]
+# nnU-Net BraTS channel convention.
+NNUNET_CHANNEL_INDEX = {"T1c": "0000", "T1": "0001", "FLAIR": "0002", "T2": "0003"}
+# Official BraTS naming for dataset.json's channel_names values (distinct from
+# our internal canonical modality names above).
+NNUNET_CHANNEL_NAMES = {"T1c": "T1C", "T1": "T1N", "FLAIR": "T2F", "T2": "T2W"}
+# This repo's ground-truth labels are a single binary tumor mask (confirmed
+# via tumor_volume/*.nii.gz: unique values are always [0, 1]) -- not BraTS's
+# multi-class WT/TC/ET region scheme, which needs 3 distinct label values
+# this dataset doesn't have.
+NNUNET_LABELS = {"background": 0, "tumor": 1}
+# Label naming (braintracking scheme) is hardcoded to the FLAIR filename --
+# always look up a timepoint's label via its FLAIR sibling, regardless of
+# which modality is the registration reference.
+LABEL_HOST_MODALITY = "FLAIR"
+
+
+def case_id_for_timepoint(timepoint_key: str) -> str:
+    return f"case_{timepoint_key}"
+
 
 @dataclass
 class PreprocessSettings:
@@ -122,7 +126,8 @@ class PreprocessSettings:
 
 @dataclass
 class PreprocessResult:
-    case: str
+    case_id: str
+    modality: str  # canonical modality name, or "label"
     input_path: Path
     output_path: Optional[Path] = None
     mask_path: Optional[Path] = None
@@ -143,9 +148,84 @@ class PreprocessResult:
     label_status: str = ""  # "", "ok", "not_found", "failed"
     label_error: str = ""
 
+    @property
+    def case(self) -> str:
+        return f"{self.case_id}/{self.modality}"
+
 
 # --------------------------------------------------------------------------
-# Stage 1 (per case, main venv/ants): N4 + register-or-resample-or-passthrough
+# Timepoint grouping: discover scans, classify modality, group by timepoint
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class TimepointGroup:
+    key: str
+    modalities: dict[str, Path] = field(default_factory=dict)  # canonical modality -> path
+    label_path: Optional[Path] = None
+
+
+def discover_timepoint_groups(
+    input_dir: Path,
+    pattern: str,
+    recursive: bool,
+    labels_dir: Optional[Path],
+    labels_naming_scheme: str,
+) -> list[TimepointGroup]:
+    scans = discover_scans(input_dir, pattern, recursive)
+    map_scan_to_label = LABEL_NAMING_SCHEMES[labels_naming_scheme] if labels_dir is not None else None
+
+    groups: dict[str, dict[str, Path]] = {}
+    for scan_path in scans:
+        stem = strip_nifti_suffix(scan_path.name)
+        if "_" not in stem:
+            logger.warning("%s: filename has no '<modality>_<timepoint>' structure -- skipping", scan_path.name)
+            continue
+        prefix_token, timepoint_key = stem.split("_", 1)
+        modality = guess_modality(prefix_token)
+        if modality == "unknown":
+            logger.warning("%s: could not guess modality from prefix '%s' -- skipping", scan_path.name, prefix_token)
+            continue
+        groups.setdefault(timepoint_key, {})[modality] = scan_path
+
+    timepoint_groups = []
+    for timepoint_key in sorted(groups):
+        modalities = groups[timepoint_key]
+        if not any(m in modalities for m in REFERENCE_PRIORITY):
+            logger.warning(
+                "%s: none of the reference-eligible modalities %s present -- skipping timepoint",
+                timepoint_key, REFERENCE_PRIORITY,
+            )
+            continue
+
+        label_path = None
+        if map_scan_to_label is not None and LABEL_HOST_MODALITY in modalities:
+            try:
+                candidate = labels_dir / map_scan_to_label(modalities[LABEL_HOST_MODALITY].name)
+                if candidate.is_file():
+                    label_path = candidate
+                else:
+                    logger.info("%s: no matching label at %s -- processing scans only", timepoint_key, candidate)
+            except ValueError as exc:
+                logger.warning("%s: could not derive label filename -- %s", timepoint_key, exc)
+
+        timepoint_groups.append(TimepointGroup(key=timepoint_key, modalities=modalities, label_path=label_path))
+
+    return timepoint_groups
+
+
+def pick_reference_modality(modalities: dict[str, Path]) -> str:
+    for m in REFERENCE_PRIORITY:
+        if m in modalities:
+            return m
+    raise ValueError(f"no reference-eligible modality present among {sorted(modalities)}")
+
+
+# --------------------------------------------------------------------------
+# Stage 1 (per timepoint, main venv/ants): N4 + intra-subject coregister +
+# atlas register -- reference modality first, then each dependent modality
+# via ONE composed transform (dependent->reference->atlas), avoiding a
+# double resample.
 # --------------------------------------------------------------------------
 
 
@@ -153,67 +233,89 @@ def resample_isotropic(img: "ants.ANTsImage", interpolator: str) -> "ants.ANTsIm
     return ants.resample_image(img, (1.0, 1.0, 1.0), use_voxels=False, interp_type=INTERP_CODES[interpolator])
 
 
-def stage1_prepare(
-    scan_path: Path,
-    label_path: Optional[Path],
-    fixed_img: Optional["ants.ANTsImage"],
-    out_image_path: Path,
-    out_label_path: Optional[Path],
-    transforms_dir: Optional[Path],
-    case: str,
-    settings: PreprocessSettings,
+def load_and_n4(path: Path, do_n4: bool) -> "ants.ANTsImage":
+    img = ants.image_read(str(path))
+    if do_n4:
+        img = ants.n4_bias_field_correction(img)
+    return img
+
+
+def stage1_register_reference(
+    reference_path: Path, fixed_img: Optional["ants.ANTsImage"], settings: PreprocessSettings
 ) -> dict:
-    moving = ants.image_read(str(scan_path))
+    """Register the timepoint's reference modality to the atlas (or resample/
+    passthrough if --no-register). Returns the warped image, the forward
+    transform list to reuse for dependents (empty if none), the reference's
+    own N4'd native-space image (the fixed target for dependents' intra-
+    subject registration), and the "group fixed image" every modality in
+    this timepoint gets resampled onto."""
+    n4_img = load_and_n4(reference_path, settings.n4_correct)
     info = {
-        "input_shape": tuple(moving.shape),
-        "input_spacing": tuple(moving.spacing),
-        "nonzero_frac_before": float((moving.numpy() > 0).mean()),
-        "steps": [],
+        "input_shape": tuple(ants.image_read(str(reference_path)).shape),
+        "steps": ["n4"] if settings.n4_correct else [],
     }
 
-    if settings.n4_correct:
-        moving = ants.n4_bias_field_correction(moving)
-        info["steps"].append("n4")
-
-    label_img = ants.image_read(str(label_path)) if label_path is not None else None
-    warped_label = None
-
     if settings.do_register:
-        reg = ants.registration(fixed=fixed_img, moving=moving, type_of_transform=settings.transform_type)
+        reg = ants.registration(fixed=fixed_img, moving=n4_img, type_of_transform=settings.transform_type)
         warped = ants.apply_transforms(
-            fixed=fixed_img, moving=moving, transformlist=reg["fwdtransforms"], interpolator=settings.interpolator
+            fixed=fixed_img, moving=n4_img, transformlist=reg["fwdtransforms"], interpolator=settings.interpolator
         )
-        info["steps"].append("register")
-        if transforms_dir is not None:
-            save_transforms(reg["fwdtransforms"], transforms_dir / case)
-        if label_img is not None:
-            warped_label = ants.apply_transforms(
-                fixed=fixed_img, moving=label_img, transformlist=reg["fwdtransforms"], interpolator="genericLabel"
-            )
+        fwd_transforms = reg["fwdtransforms"]
+        group_fixed_img = fixed_img
+        info["steps"].append("register_atlas")
     elif settings.do_resample:
-        warped = resample_isotropic(moving, settings.interpolator)
+        warped = resample_isotropic(n4_img, settings.interpolator)
+        fwd_transforms = []
+        group_fixed_img = warped
         info["steps"].append("resample")
-        if label_img is not None:
-            warped_label = resample_isotropic(label_img, "nearestNeighbor")
     else:
-        warped = moving
-        if label_img is not None:
-            warped_label = label_img
+        warped = n4_img
+        fwd_transforms = []
+        group_fixed_img = warped
 
-    out_image_path.parent.mkdir(parents=True, exist_ok=True)
-    ants.image_write(warped, str(out_image_path))
-    info["output_shape"] = tuple(warped.shape)
-    info["output_spacing"] = tuple(warped.spacing)
+    info["warped"] = warped
+    info["fwd_transforms"] = fwd_transforms
+    info["reference_n4_img"] = n4_img
+    info["group_fixed_img"] = group_fixed_img
+    return info
 
-    if warped_label is not None:
-        out_label_path.parent.mkdir(parents=True, exist_ok=True)
-        ants.image_write(warped_label, str(out_label_path))
 
+def stage1_register_dependent(
+    dependent_path: Path,
+    reference_n4_img: "ants.ANTsImage",
+    group_fixed_img: "ants.ANTsImage",
+    reference_fwd_transforms: list,
+    settings: PreprocessSettings,
+) -> dict:
+    """Co-register a dependent modality to the (native-space) reference, then
+    warp it directly into the group's shared grid in ONE resample by
+    composing [reference_fwd_transforms, dependent->reference transforms].
+    ANTs/ITK's apply_transforms applies the LAST-listed transform first, so
+    the reference's own transform (dependent-space -> ... -> atlas/group
+    space) must be listed first and the intra-subject transform last --
+    empirically verified against a two-step sequential resample."""
+    n4_img = load_and_n4(dependent_path, settings.n4_correct)
+    info = {
+        "input_shape": tuple(ants.image_read(str(dependent_path)).shape),
+        "steps": (["n4"] if settings.n4_correct else []) + ["coregister_to_reference"],
+    }
+
+    reg_dep = ants.registration(fixed=reference_n4_img, moving=n4_img, type_of_transform=settings.transform_type)
+    transformlist = list(reference_fwd_transforms) + list(reg_dep["fwdtransforms"])
+    warped = ants.apply_transforms(
+        fixed=group_fixed_img, moving=n4_img, transformlist=transformlist, interpolator=settings.interpolator
+    )
+    if reference_fwd_transforms:
+        info["steps"].append("register_atlas")
+
+    info["warped"] = warped
+    info["transformlist"] = transformlist
     return info
 
 
 # --------------------------------------------------------------------------
-# Stage 2 (batch subprocess, isolated hdbet_venv): skull-strip images only
+# Stage 2 (batch subprocess, isolated hdbet_venv): skull-strip the
+# reference-modality atlas-space image only, once per timepoint.
 # --------------------------------------------------------------------------
 
 
@@ -242,7 +344,7 @@ def run_hdbet(input_dir: Path, output_dir: Path, hdbet_bin: Path, device: str, d
 
 
 # --------------------------------------------------------------------------
-# Stage 3 (per case, main venv/numpy): normalize image, mask label
+# Stage 3 (per output file, main venv/numpy): normalize image, mask label
 # --------------------------------------------------------------------------
 
 
@@ -417,6 +519,26 @@ def run_verification(
     return verifications
 
 
+def write_dataset_json(output_dir: Path, labels_out_dir: Path) -> Path:
+    """Write nnU-Net v2's dataset.json descriptor. numTraining is derived by
+    counting labelsTr/*.nii.gz on disk (not in-memory results) so it stays
+    correct across reruns where some/all cases were skipped as already done."""
+    # dataset.json's channel_names keys are plain integers ("0", "1", ...),
+    # distinct from the zero-padded "0000" suffix used in filenames.
+    channel_names = {str(int(index)): NNUNET_CHANNEL_NAMES[modality] for modality, index in NNUNET_CHANNEL_INDEX.items()}
+    num_training = len(list(labels_out_dir.glob("*.nii.gz"))) if labels_out_dir.is_dir() else 0
+    dataset_json = {
+        "channel_names": channel_names,
+        "labels": NNUNET_LABELS,
+        "numTraining": num_training,
+        "file_ending": ".nii.gz",
+        "overwrite_image_reader_writer": "SimpleITKIO",
+    }
+    dataset_json_path = output_dir / "dataset.json"
+    dataset_json_path.write_text(json.dumps(dataset_json, indent=2))
+    return dataset_json_path
+
+
 def format_verification_text(verifications: list[VerificationResult]) -> str:
     lines = ["BraTS PREPROCESSING VERIFICATION", "=" * 70, ""]
     n_pass = sum(v.all_ok for v in verifications)
@@ -452,8 +574,8 @@ def run(
     overwrite: bool,
     verify: bool = True,
 ) -> pd.DataFrame:
-    scans = discover_scans(input_dir, pattern, recursive)
-    logger.info("Found %d scan(s) in %s", len(scans), input_dir)
+    timepoint_groups = discover_timepoint_groups(input_dir, pattern, recursive, labels_dir, labels_naming_scheme)
+    logger.info("Found %d timepoint(s) in %s", len(timepoint_groups), input_dir)
 
     fixed_img = None
     if settings.do_register:
@@ -461,158 +583,202 @@ def run(
         logger.info("Using SRI24 '%s' template: %s", template_channel, fixed_path)
         fixed_img = ants.image_read(str(fixed_path))
 
-    map_scan_to_label = LABEL_NAMING_SCHEMES[labels_naming_scheme] if labels_dir is not None else None
-
-    images_dir = output_dir / "images"
-    labels_out_dir = output_dir / "labels"
+    images_dir = output_dir / "imagesTr"
+    labels_out_dir = output_dir / "labelsTr"
     masks_dir = output_dir / "masks"
     transforms_dir = output_dir / "transforms" if (save_transforms_flag and settings.do_register) else None
     tmp_dir = output_dir / "_intermediate"
-    stage1_images_dir = tmp_dir / "stage1_images"
+    stage1_reference_dir = tmp_dir / "stage1_reference"  # fed to HD-BET, one file per case
+    stage1_dependent_dir = tmp_dir / "stage1_dependent"
     stage1_labels_dir = tmp_dir / "stage1_labels"
     stage2_images_dir = tmp_dir / "stage2_skullstripped"
+    stage2_dependent_masked_dir = tmp_dir / "stage2_dependent_masked"
 
-    # ---- Stage 1: per case, N4 + register/resample/passthrough ----------
+    # ---- Stage 1: per timepoint, N4 + intra-subject coregister + register -
     cases: list[dict] = []
-    for i, scan_path in enumerate(scans, start=1):
-        rel_path = scan_path.relative_to(input_dir)
-        case = str((rel_path.parent / strip_nifti_suffix(scan_path.name)).as_posix())
-        final_image_path = images_dir / rel_path.parent / f"{strip_nifti_suffix(scan_path.name)}.nii.gz"
+    for i, group in enumerate(timepoint_groups, start=1):
+        case_id = case_id_for_timepoint(group.key)
+        expected_paths = [images_dir / f"{case_id}_{NNUNET_CHANNEL_INDEX[m]}.nii.gz" for m in group.modalities]
+        if group.label_path is not None:
+            expected_paths.append(labels_out_dir / f"{case_id}.nii.gz")
 
-        if final_image_path.exists() and not overwrite:
-            logger.info("[%d/%d] %s: output already exists, skipping (--overwrite to redo)", i, len(scans), case)
-            cases.append({"case": case, "scan_path": scan_path, "status": "skipped"})
+        if not overwrite and all(p.exists() for p in expected_paths):
+            logger.info("[%d/%d] %s: all outputs already exist, skipping (--overwrite to redo)", i, len(timepoint_groups), case_id)
+            cases.append({"case_id": case_id, "group": group, "status": "skipped"})
             continue
 
-        label_path = None
-        if map_scan_to_label is not None:
-            try:
-                candidate = labels_dir / map_scan_to_label(scan_path.name)
-                if candidate.is_file():
-                    label_path = candidate
-                else:
-                    logger.info("%s: no matching label at %s -- processing scan only", case, candidate)
-            except ValueError as exc:
-                logger.warning("%s: could not derive label filename -- %s", case, exc)
-
-        stage1_out = stage1_images_dir / rel_path.parent / f"{strip_nifti_suffix(scan_path.name)}.nii.gz"
-        stage1_label_out = (
-            stage1_labels_dir / map_scan_to_label(scan_path.name) if label_path is not None else None
-        )
-
-        result = PreprocessResult(case=case, input_path=scan_path, label_input_path=label_path)
+        logger.info("[%d/%d] %s: stage 1 (register)", i, len(timepoint_groups), case_id)
         t0 = time.time()
         try:
-            logger.info("[%d/%d] %s: stage 1 (prepare)", i, len(scans), case)
-            info = stage1_prepare(
-                scan_path, label_path, fixed_img, stage1_out, stage1_label_out, transforms_dir, case, settings
+            reference_modality = pick_reference_modality(group.modalities)
+            reference_path = group.modalities[reference_modality]
+            ref_info = stage1_register_reference(reference_path, fixed_img, settings)
+
+            modality_results: dict[str, dict] = {reference_modality: ref_info}
+            transformlists: dict[str, list] = {reference_modality: ref_info["fwd_transforms"]}
+            for modality, dep_path in group.modalities.items():
+                if modality == reference_modality:
+                    continue
+                dep_info = stage1_register_dependent(
+                    dep_path, ref_info["reference_n4_img"], ref_info["group_fixed_img"], ref_info["fwd_transforms"], settings
+                )
+                modality_results[modality] = dep_info
+                transformlists[modality] = dep_info["transformlist"]
+
+            stage1_paths: dict[str, Path] = {}
+            for modality, info in modality_results.items():
+                out_path = (
+                    (stage1_reference_dir / f"{case_id}.nii.gz")
+                    if modality == reference_modality
+                    else (stage1_dependent_dir / f"{case_id}_{modality}.nii.gz")
+                )
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                ants.image_write(info["warped"], str(out_path))
+                stage1_paths[modality] = out_path
+
+            stage1_label_path = None
+            label_status = ""
+            if group.label_path is not None:
+                if LABEL_HOST_MODALITY in transformlists:
+                    label_img = ants.image_read(str(group.label_path))
+                    tlist = transformlists[LABEL_HOST_MODALITY]
+                    warped_label = (
+                        ants.apply_transforms(
+                            fixed=ref_info["group_fixed_img"], moving=label_img, transformlist=tlist, interpolator="genericLabel"
+                        )
+                        if tlist
+                        else label_img
+                    )
+                    stage1_label_path = stage1_labels_dir / f"{case_id}.nii.gz"
+                    stage1_label_path.parent.mkdir(parents=True, exist_ok=True)
+                    ants.image_write(warped_label, str(stage1_label_path))
+                    label_status = "ok"
+                else:
+                    label_status = "not_found"
+
+            cases.append(
+                {
+                    "case_id": case_id,
+                    "group": group,
+                    "reference_modality": reference_modality,
+                    "modality_results": modality_results,
+                    "stage1_paths": stage1_paths,
+                    "stage1_label_path": stage1_label_path,
+                    "label_status": label_status,
+                    "elapsed_stage1": time.time() - t0,
+                    "status": "prepared",
+                }
             )
-            result.input_shape = info["input_shape"]
-            result.input_spacing = info["input_spacing"]
-            result.nonzero_frac_before = info["nonzero_frac_before"]
-            result.output_shape = info["output_shape"]
-            result.output_spacing = info["output_spacing"]
-            result.steps_applied = ",".join(info["steps"])
-            if label_path is not None:
-                result.label_status = "ok" if stage1_label_out.is_file() else "failed"
-        except Exception as exc:  # one bad scan shouldn't kill the whole batch
-            result.status = "failed"
-            result.error = str(exc)
-            result.elapsed_sec = time.time() - t0
-            logger.error("%s: stage 1 failed -- %s", case, exc)
-            cases.append({"case": case, "scan_path": scan_path, "result": result, "status": "failed"})
-            continue
-        result.elapsed_sec = time.time() - t0
+        except Exception as exc:  # one bad timepoint shouldn't kill the whole batch
+            logger.error("%s: stage 1 failed -- %s", case_id, exc)
+            cases.append({"case_id": case_id, "group": group, "status": "failed", "error": str(exc), "elapsed_stage1": time.time() - t0})
 
-        cases.append(
-            {
-                "case": case,
-                "scan_path": scan_path,
-                "rel_dir": rel_path.parent,
-                "stage1_image": stage1_out,
-                "stage1_label": stage1_label_out,
-                "label_filename": map_scan_to_label(scan_path.name) if label_path is not None else None,
-                "final_image_path": final_image_path,
-                "result": result,
-                "status": "prepared",
-            }
-        )
-
-    # ---- Stage 2: batch skull-strip (separate venv, images only) --------
+    # ---- Stage 2: batch skull-strip (separate venv), reference images only
     if settings.do_skull_strip and any(c["status"] == "prepared" for c in cases):
         hdbet_bin = hdbet_venv_dir / "bin" / "hd-bet"
         if not hdbet_bin.is_file():
             raise FileNotFoundError(f"hd-bet not found at {hdbet_bin} -- run scripts/setup_hdbet_venv.sh first")
         device = resolve_hdbet_device(settings.hdbet_device, hdbet_venv_dir)
         logger.info("Stage 2 (skull-strip, batch, device=%s)", device)
-        run_hdbet(stage1_images_dir, stage2_images_dir, hdbet_bin, device, settings.hdbet_disable_tta)
+        run_hdbet(stage1_reference_dir, stage2_images_dir, hdbet_bin, device, settings.hdbet_disable_tta)
 
-    # ---- Stage 3: per case, normalize + mask label -----------------------
+    # ---- Stage 3: per timepoint, normalize + mask label with shared mask --
+    results: list[PreprocessResult] = []
     for c in cases:
-        if c["status"] != "prepared":
+        case_id = c["case_id"]
+        group: TimepointGroup = c["group"]
+
+        if c["status"] == "skipped":
+            for modality in group.modalities:
+                results.append(PreprocessResult(case_id=case_id, modality=modality, input_path=group.modalities[modality], status="skipped"))
+            if group.label_path is not None:
+                results.append(PreprocessResult(case_id=case_id, modality="label", input_path=group.label_path, status="skipped"))
             continue
-        case = c["case"]
-        result: PreprocessResult = c["result"]
-        t0 = time.time()
-        try:
-            skull_stripped_path = None
-            mask_path = None
-            if settings.do_skull_strip:
-                candidate_img = stage2_images_dir / c["stage1_image"].name
-                candidate_mask = stage2_images_dir / f"{strip_nifti_suffix(c['stage1_image'].name)}{MASK_SUFFIX}"
-                if candidate_img.is_file():
-                    skull_stripped_path = candidate_img
-                if candidate_mask.is_file():
-                    mask_path = candidate_mask
+        if c["status"] == "failed":
+            for modality in group.modalities:
+                results.append(PreprocessResult(case_id=case_id, modality=modality, input_path=group.modalities[modality], status="failed", error=c["error"]))
+            continue
 
-            logger.info("[%s] stage 3 (finalize)", case)
-            info = stage3_finalize_image(
-                c["stage1_image"], skull_stripped_path, mask_path, c["final_image_path"], settings
+        reference_modality = c["reference_modality"]
+        stage1_paths = c["stage1_paths"]
+        modality_results = c["modality_results"]
+
+        mask_path = None
+        if settings.do_skull_strip:
+            candidate_mask = stage2_images_dir / f"{case_id}{MASK_SUFFIX}"
+            if candidate_mask.is_file():
+                mask_path = candidate_mask
+        final_mask_path = None
+        if mask_path is not None:
+            final_mask_path = masks_dir / f"{case_id}_mask.nii.gz"
+            final_mask_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(mask_path, final_mask_path)
+
+        for modality, stage1_path in stage1_paths.items():
+            t0 = time.time()
+            result = PreprocessResult(
+                case_id=case_id, modality=modality, input_path=group.modalities[modality],
+                input_shape=modality_results[modality]["input_shape"],
             )
-            result.output_path = c["final_image_path"]
-            result.nonzero_frac_after = info["nonzero_frac_after"]
-            result.brain_mean_raw = info.get("brain_mean_raw")
-            result.brain_std_raw = info.get("brain_std_raw")
-            if info["steps"]:
-                result.steps_applied = ",".join([s for s in result.steps_applied.split(",") if s] + info["steps"])
-            if mask_path is not None:
-                final_mask_path = masks_dir / c["rel_dir"] / mask_path.name
-                final_mask_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(mask_path, final_mask_path)
-                result.mask_path = final_mask_path
-
-            if c["stage1_label"] is not None and c["stage1_label"].is_file():
-                final_label_path = labels_out_dir / c["rel_dir"] / c["label_filename"]
-                if mask_path is not None:
-                    mask_result = apply_mask_to_label(c["stage1_label"], mask_path, final_label_path)
-                    result.label_status = mask_result.status
-                    result.label_error = mask_result.error
+            final_image_path = images_dir / f"{case_id}_{NNUNET_CHANNEL_INDEX[modality]}.nii.gz"
+            try:
+                if modality == reference_modality:
+                    skull_stripped_path = stage2_images_dir / stage1_path.name if mask_path is not None else None
                 else:
-                    final_label_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(c["stage1_label"], final_label_path)
-                    result.label_status = "ok"
-                result.label_output_path = final_label_path
+                    skull_stripped_path = None
+                    if mask_path is not None:
+                        skull_stripped_path = stage2_dependent_masked_dir / stage1_path.name
+                        mask_image(stage1_path, mask_path, skull_stripped_path)
 
-            result.status = "ok"
-        except Exception as exc:
-            result.status = "failed"
-            result.error = str(exc)
-            logger.error("%s: stage 3 failed -- %s", case, exc)
-        result.elapsed_sec += time.time() - t0
+                info = stage3_finalize_image(stage1_path, skull_stripped_path, mask_path, final_image_path, settings)
+                result.output_path = final_image_path
+                result.output_shape = tuple(nib.load(str(final_image_path)).shape[:3])
+                result.output_spacing = tuple(float(s) for s in nib.load(str(final_image_path)).header.get_zooms()[:3])
+                result.nonzero_frac_after = info["nonzero_frac_after"]
+                result.brain_mean_raw = info.get("brain_mean_raw")
+                result.brain_std_raw = info.get("brain_std_raw")
+                result.mask_path = final_mask_path
+                result.steps_applied = ",".join(modality_results[modality]["steps"] + info["steps"])
+                result.status = "ok"
+            except Exception as exc:
+                result.status = "failed"
+                result.error = str(exc)
+                logger.error("%s/%s: stage 3 failed -- %s", case_id, modality, exc)
+            result.elapsed_sec = c["elapsed_stage1"] / len(stage1_paths) + (time.time() - t0)
+            results.append(result)
+
+        if group.label_path is not None:
+            label_result = PreprocessResult(case_id=case_id, modality="label", input_path=group.label_path)
+            label_result.label_input_path = group.label_path
+            final_label_path = labels_out_dir / f"{case_id}.nii.gz"
+            if c["stage1_label_path"] is not None:
+                try:
+                    if mask_path is not None:
+                        mask_result = apply_mask_to_label(c["stage1_label_path"], mask_path, final_label_path)
+                        label_result.label_status = mask_result.status
+                        label_result.label_error = mask_result.error
+                    else:
+                        final_label_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(c["stage1_label_path"], final_label_path)
+                        label_result.label_status = "ok"
+                    label_result.label_output_path = final_label_path
+                    label_result.output_path = final_label_path
+                    label_result.status = "ok" if label_result.label_status == "ok" else "failed"
+                except Exception as exc:
+                    label_result.status = "failed"
+                    label_result.error = str(exc)
+                    logger.error("%s: label finalize failed -- %s", case_id, exc)
+            else:
+                label_result.status = "failed"
+                label_result.label_status = c.get("label_status", "not_found")
+            results.append(label_result)
 
     if not (output_dir / "_keep_intermediate").exists():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ---- Report -----------------------------------------------------------
-    results = []
-    for c in cases:
-        if "result" in c:
-            results.append(c["result"])
-        else:
-            results.append(PreprocessResult(case=c["case"], input_path=c["scan_path"], status=c["status"]))
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame([asdict(r) for r in results])
+    df = pd.DataFrame([asdict(r) | {"case": r.case} for r in results])
     df.to_csv(output_dir / "preprocess_report.csv", index=False)
 
     (output_dir / "preprocess_report.txt").write_text(format_report_text(results))
@@ -625,12 +791,19 @@ def run(
         "Done: %d ok, %d failed, %d skipped. Reports written to %s", n_ok, n_failed, n_skipped, output_dir
     )
 
+    if labels_dir is not None:
+        dataset_json_path = write_dataset_json(output_dir, labels_out_dir)
+        logger.info("Wrote %s", dataset_json_path)
+    else:
+        logger.info("--labels-dir not set -- skipping dataset.json (nnU-Net needs a label per training case)")
+
     # ---- Verification (independent re-check of the saved output files) --
     if verify:
         reference_orientation = None
         if settings.do_register:
             reference_orientation = resolve_reference_orientation(template_channel, template_cache_dir)
-        verifications = run_verification(results, settings, reference_orientation)
+        image_results = [r for r in results if r.modality != "label"]
+        verifications = run_verification(image_results, settings, reference_orientation)
         pd.DataFrame([asdict(v) for v in verifications]).to_csv(output_dir / "verification_report.csv", index=False)
         (output_dir / "verification_report.txt").write_text(format_verification_text(verifications))
 
@@ -663,18 +836,20 @@ def format_report_text(results: list[PreprocessResult]) -> str:
             lines.append(f"    FAILED: {r.error}")
             lines.append("")
             continue
+        if r.modality == "label":
+            lines.append(f"    label: {r.label_status}" + (f" -- {r.label_error}" if r.label_error else ""))
+            lines.append("")
+            continue
         lines.append(f"    steps applied: {r.steps_applied}")
         lines.append(f"    shape: {r.input_shape} -> {r.output_shape}")
-        lines.append(f"    spacing_mm: {r.input_spacing} -> {r.output_spacing}")
-        lines.append(f"    nonzero fraction: {r.nonzero_frac_before:.1%} -> {r.nonzero_frac_after:.1%}")
+        lines.append(f"    spacing_mm: -> {r.output_spacing}")
+        lines.append(f"    nonzero fraction after: {r.nonzero_frac_after:.1%}")
         if r.brain_mean_raw is not None:
             lines.append(
                 f"    pre-normalization brain intensity: mean={r.brain_mean_raw:.3f} std={r.brain_std_raw:.3f} "
                 "(the z-score parameters -- output voxels within the brain mask are scaled to mean~0/std~1)"
             )
         lines.append(f"    elapsed: {r.elapsed_sec:.1f}s")
-        if r.label_input_path is not None:
-            lines.append(f"    label: {r.label_status}" + (f" -- {r.label_error}" if r.label_error else ""))
         lines.append("")
     return "\n".join(lines)
 
@@ -690,19 +865,22 @@ def format_summary_text(
     lines.append(f"  N4 bias correction:   {settings.n4_correct}")
     lines.append(f"  Co-register to SRI24: {settings.do_register} (transform={settings.transform_type})")
     lines.append(f"  Standalone resample:  {settings.do_resample} (only applies if register is off)")
-    lines.append(f"  Skull-strip (HD-BET): {settings.do_skull_strip} (device={settings.hdbet_device or 'auto'})")
+    lines.append(f"  Skull-strip (HD-BET), shared mask per case: {settings.do_skull_strip} (device={settings.hdbet_device or 'auto'})")
     lines.append(f"  Z-score normalize:    {settings.do_normalize}")
     lines.append("")
 
-    n_total = len(results)
-    ok = [r for r in results if r.status == "ok"]
-    n_ok, n_failed, n_skipped = len(ok), sum(r.status == "failed" for r in results), sum(r.status == "skipped" for r in results)
-    n_with_label = sum(1 for r in ok if r.label_input_path is not None)
-    n_label_ok = sum(1 for r in ok if r.label_status == "ok")
+    image_results = [r for r in results if r.modality != "label"]
+    label_results = [r for r in results if r.modality == "label"]
+    n_total = len(image_results)
+    ok = [r for r in image_results if r.status == "ok"]
+    n_ok, n_failed, n_skipped = len(ok), sum(r.status == "failed" for r in image_results), sum(r.status == "skipped" for r in image_results)
+    n_cases = len({r.case_id for r in results})
+    n_label_ok = sum(1 for r in label_results if r.status == "ok")
 
-    lines.append(f"Cases: {n_total} total -- {n_ok} ok, {n_failed} failed, {n_skipped} skipped")
-    if n_with_label:
-        lines.append(f"Labels: {n_with_label} case(s) had a matching label -- {n_label_ok} preprocessed ok")
+    lines.append(f"Timepoints (cases): {n_cases}")
+    lines.append(f"Image files: {n_total} total -- {n_ok} ok, {n_failed} failed, {n_skipped} skipped")
+    if label_results:
+        lines.append(f"Labels: {len(label_results)} case(s) had a matching label -- {n_label_ok} preprocessed ok")
 
     if ok:
         shapes = sorted({r.output_shape for r in ok}, key=str)
@@ -710,7 +888,7 @@ def format_summary_text(
         lines.append(f"Output shapes seen: {shapes}")
         lines.append(f"Output spacings seen (mm): {spacings}")
         total_sec = sum(r.elapsed_sec for r in ok)
-        lines.append(f"Total per-case elapsed (excludes batch skull-strip time): {total_sec:.1f}s")
+        lines.append(f"Total per-file elapsed: {total_sec:.1f}s")
         if settings.do_normalize:
             means = [r.brain_mean_raw for r in ok if r.brain_mean_raw is not None]
             stds = [r.brain_std_raw for r in ok if r.brain_std_raw is not None]
@@ -724,7 +902,7 @@ def format_summary_text(
 
     if n_failed:
         lines.append("")
-        lines.append(f"BLOCKING: {n_failed} case(s) failed -- see preprocess_report.txt for details.")
+        lines.append(f"BLOCKING: {n_failed} image file(s) failed -- see preprocess_report.txt for details.")
 
     return "\n".join(lines)
 
@@ -736,39 +914,40 @@ def format_summary_text(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Single-entry-point BraTS-like preprocessing: N4, co-register, skull-strip, z-score normalize -- one input folder, one output folder.",
+        description="BraTS-matched multi-modality preprocessing: N4, intra-subject coregister to one reference "
+        "modality per timepoint, co-register to SRI24, shared skull-strip mask, z-score normalize -- nnU-Net-ready output.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--input-dir", required=True, type=Path, help="Folder containing scans to preprocess")
-    parser.add_argument("--output-dir", required=True, type=Path, help="Where all outputs are written (images/, labels/, masks/, reports)")
+    parser.add_argument("--output-dir", required=True, type=Path, help="Where all outputs are written (imagesTr/, labelsTr/, masks/, reports)")
     parser.add_argument("--pattern", default="*.nii.gz", help="Glob pattern (relative to --input-dir) for scans")
     parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True, help="Search --input-dir recursively")
 
-    parser.add_argument("--labels-dir", type=Path, default=None, help="Folder of ground-truth labels to preprocess alongside their matching scan")
+    parser.add_argument("--labels-dir", type=Path, default=None, help="Folder of ground-truth labels to preprocess alongside their matching timepoint (looked up via the FLAIR scan)")
     parser.add_argument(
         "--labels-naming-scheme",
         choices=sorted(LABEL_NAMING_SCHEMES),
         default="identical",
-        help="'identical' (same filename), or 'braintracking' (scan 'flair_2016_11.nii.gz' -> label 'tumor_2016-11.nii.gz')",
+        help="'identical' (same filename as the FLAIR scan), or 'braintracking' (scan 'flair_2016_11.nii.gz' -> label 'tumor_2016-11.nii.gz')",
     )
 
     parser.add_argument("--n4-correct", action=argparse.BooleanOptionalAction, default=True, help="Step 1: N4 bias field correction")
 
-    parser.add_argument("--register", dest="do_register", action=argparse.BooleanOptionalAction, default=True, help="Step 2: rigid co-registration to SRI24 (also yields isotropic spacing)")
+    parser.add_argument("--register", dest="do_register", action=argparse.BooleanOptionalAction, default=True, help="Step 3: rigid co-registration of the reference modality to SRI24 (also yields isotropic spacing)")
     parser.add_argument("--template-channel", choices=sorted(SRI24_CHANNELS), default="spgr_unstrip", help="SRI24 channel to register to (spgr_unstrip=skull-on, spgr=skull-stripped)")
     parser.add_argument("--template-path", type=Path, default=None, help="Use this NIfTI file instead of auto-downloading --template-channel")
     parser.add_argument("--template-cache-dir", type=Path, default=DEFAULT_TEMPLATE_CACHE_DIR, help="Where downloaded SRI24 template channels are cached")
-    parser.add_argument("--transform-type", choices=["Rigid", "Affine", "SyN", "SyNRA"], default="Rigid", help="ANTs transform type for --register (BraTS uses Rigid to preserve true volume)")
-    parser.add_argument("--interpolator", choices=["linear", "bSpline", "nearestNeighbor"], default="linear", help="Interpolation for resampling the image (not the label, which always uses a label-preserving interpolator)")
+    parser.add_argument("--transform-type", choices=["Rigid", "Affine", "SyN", "SyNRA"], default="Rigid", help="ANTs transform type, used for both intra-subject coregistration and atlas registration (BraTS uses Rigid to preserve true volume)")
+    parser.add_argument("--interpolator", choices=["linear", "bSpline", "nearestNeighbor"], default="linear", help="Interpolation for resampling images (not labels, which always use a label-preserving interpolator)")
 
-    parser.add_argument("--resample", dest="do_resample", action=argparse.BooleanOptionalAction, default=True, help="Step 3: standalone isotropic resample -- only takes effect when --no-register is set")
+    parser.add_argument("--resample", dest="do_resample", action=argparse.BooleanOptionalAction, default=True, help="Standalone isotropic resample of the reference modality -- only takes effect when --no-register is set")
 
-    parser.add_argument("--skull-strip", dest="do_skull_strip", action=argparse.BooleanOptionalAction, default=True, help="Step 4: skull-strip via HD-BET (needs scripts/setup_hdbet_venv.sh run once first)")
+    parser.add_argument("--skull-strip", dest="do_skull_strip", action=argparse.BooleanOptionalAction, default=True, help="Step 4: skull-strip the reference modality via HD-BET and reuse that ONE mask for all modalities of the timepoint (needs scripts/setup_hdbet_venv.sh run once first)")
     parser.add_argument("--hdbet-venv-dir", type=Path, default=None, help="Where HD-BET's isolated venv lives (default: '<repo>/hdbet_venv')")
     parser.add_argument("--hdbet-device", default="", help="cpu, cuda, or mps -- empty auto-detects (cuda if available, else cpu)")
     parser.add_argument("--hdbet-disable-tta", action="store_true", help="Disable HD-BET test-time augmentation (faster, slightly lower quality -- consider it on cpu)")
 
-    parser.add_argument("--normalize", dest="do_normalize", action=argparse.BooleanOptionalAction, default=True, help="Step 5: z-score intensity normalization within the brain mask")
+    parser.add_argument("--normalize", dest="do_normalize", action=argparse.BooleanOptionalAction, default=True, help="Step 5: z-score intensity normalization within the shared brain mask")
 
     parser.add_argument("--save-transforms", action=argparse.BooleanOptionalAction, default=True, help="Persist each case's registration transforms under output_dir/transforms/ (only if --register)")
     parser.add_argument(
@@ -780,7 +959,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "apply given the steps that ran) and write verification_report.csv/.txt",
     )
     parser.add_argument("--keep-intermediate", action="store_true", help="Keep output_dir/_intermediate/ (per-stage files) instead of deleting it at the end")
-    parser.add_argument("--overwrite", action="store_true", help="Re-process cases whose final output already exists")
+    parser.add_argument("--overwrite", action="store_true", help="Re-process timepoints whose final outputs already exist")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
 

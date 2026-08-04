@@ -35,4 +35,4 @@ if [ -n "$MANIFEST_CSV" ]; then
   ARGS+=(--manifest-csv "$MANIFEST_CSV")
 fi
 
-"$REPO_ROOT/venv/bin/python3" "$REPO_ROOT/utils/apply_brain_mask.py" "${ARGS[@]}"
+python3 "$REPO_ROOT/utils/apply_brain_mask.py" "${ARGS[@]}"

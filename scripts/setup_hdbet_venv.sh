@@ -15,8 +15,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-HDBET_VENV_DIR="/media/storage/luu/hdbet_venv"
+source "$SCRIPT_DIR/hdbet_venv_path.sh"
 
 python3 -m venv "$HDBET_VENV_DIR"
 "$HDBET_VENV_DIR/bin/pip" install --upgrade pip
@@ -34,13 +33,37 @@ echo "First real run downloads pretrained weights automatically (needs network a
 echo ""
 
 "$HDBET_VENV_DIR/bin/python3" -c "
+import re
 import shutil
+import subprocess
 import sys
 
 import torch
 
 BAR = '=' * 70
 nvidia_smi_present = shutil.which('nvidia-smi') is not None
+
+
+def best_cuda_wheel_tag():
+    # torch.pytorch.org only publishes wheels for specific CUDA versions, not
+    # every point release -- pick the highest one that's still <= the
+    # driver's max-supported CUDA version (a driver can run code built for
+    # its own CUDA version or older, never newer). Extend this list as new
+    # tags get published (check https://download.pytorch.org/whl/).
+    known_tags = [(11, 8), (12, 1), (12, 4), (12, 6), (12, 8)]
+    try:
+        out = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r'CUDA Version:\s*(\d+)\.(\d+)', out)
+        if not m:
+            return None
+        driver_max = (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        return None
+    candidates = [t for t in known_tags if t <= driver_max]
+    if not candidates:
+        return None
+    major, minor = max(candidates)
+    return f'cu{major}{minor}'
 
 if torch.cuda.is_available():
     n = torch.cuda.device_count()
@@ -67,10 +90,19 @@ if nvidia_smi_present:
     print(BAR, file=sys.stderr)
     print('GPU CHECK FAILED', file=sys.stderr)
     print('nvidia-smi found an NVIDIA GPU, but PyTorch cannot see it (torch.cuda.is_available() is False).', file=sys.stderr)
-    print('This usually means a CPU-only torch build got installed, or a driver/CUDA version mismatch.', file=sys.stderr)
+    print('This usually means the default pip install resolved a torch build compiled for a newer CUDA', file=sys.stderr)
+    print('runtime than this driver supports (a driver runs its own CUDA version or OLDER, never newer --', file=sys.stderr)
+    print('note this is independent of HD-BET/nnU-Net\'s own torch>=2.0.0 Python-API requirement, which any', file=sys.stderr)
+    print('CUDA-tagged build still satisfies).', file=sys.stderr)
     print('Left as-is, HD-BET will SILENTLY fall back to CPU (~1-2h/scan) on a machine meant to have a GPU.', file=sys.stderr)
-    print('Try reinstalling torch in hdbet_venv with a CUDA build matching this machine\'s driver, e.g.:', file=sys.stderr)
-    print(f'  {sys.executable} -m pip install torch --index-url https://download.pytorch.org/whl/cu121', file=sys.stderr)
+    tag = best_cuda_wheel_tag()
+    if tag:
+        print(f'Detected driver supports up to CUDA matching wheel tag \'{tag}\'. Reinstall torch/torchvision for it:', file=sys.stderr)
+        print(f'  {sys.executable} -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/{tag}', file=sys.stderr)
+    else:
+        print('Could not auto-detect your driver\'s max CUDA version from nvidia-smi -- check it manually', file=sys.stderr)
+        print('(\"CUDA Version: X.Y\" in the nvidia-smi header) and reinstall a matching build, e.g.:', file=sys.stderr)
+        print(f'  {sys.executable} -m pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu121', file=sys.stderr)
     print(BAR, file=sys.stderr)
     sys.exit(1)
 
