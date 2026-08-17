@@ -13,14 +13,20 @@ Reference values (BRATS_REFERENCE_* below) come directly from this repo's
 cached SRI24 template (see register_to_sri24.py), not from a spec doc:
 * shape/spacing: read off templates/sri24/spgr.nii.gz -- identical across
   every SRI24 channel, so these don't depend on --template-channel.
-* orientation: read off whichever --template-channel file is cached (default
-  spgr). This matters because spgr.nii.gz and spgr_unstrip.nii.gz disagree
-  on L/R sign in their headers (LAS vs RAS) despite sharing the same
-  physical atlas space -- pass --template-channel spgr_unstrip if that's
-  what you register to (e.g. skull-on private scans), or you'll get a
-  spurious orientation mismatch. Note orientation is informational only --
-  it is NOT part of matches_brats_format below, since ants.registration
-  works from the full affine, not the axcode label.
+* orientation: a fixed constant (LPS), confirmed against a real BraTS-MET
+  case's header -- NOT read off the local atlas cache, because neither
+  cached channel actually matches it: spgr.nii.gz is LAS and
+  spgr_unstrip.nii.gz is RAS, despite both sharing the same physical atlas
+  space as the LPS-oriented official data. For a RAW (pre-registration)
+  scan, orientation is informational only -- it is NOT part of
+  matches_brats_format below, since ants.registration works from the full
+  affine, not the axcode label, so registering a scan of any orientation
+  still lands it in the correct physical space. It stops being
+  "informational only" once a scan has already been through
+  preprocess_brats.py and is meant to be nnU-Net-ready: nnU-Net's default
+  SimpleITKIO reader does NOT reorient to a canonical direction, so an
+  already-processed file's orientation must actually match LPS, not just
+  its shape/spacing/skull-strip status.
 * skull-stripped threshold: spgr.nii.gz (skull-stripped) is ~16% nonzero
   voxels, spgr_unstrip.nii.gz (skull-on) is ~77% -- 40% is the cutoff
   between them. It's a heuristic (a small/necrotic brain or a very tight
@@ -58,7 +64,10 @@ logger = logging.getLogger("check_brats_format")
 # Derived from templates/sri24/spgr.nii.gz -- see module docstring.
 BRATS_REFERENCE_SHAPE = (240, 240, 155)
 BRATS_REFERENCE_SPACING_MM = (1.0, 1.0, 1.0)
-BRATS_REFERENCE_ORIENTATION_FALLBACK = "LAS"  # used only if --template-channel isn't cached locally
+# Fixed -- see module docstring. NOT derived from the local atlas cache:
+# spgr.nii.gz (LAS) and spgr_unstrip.nii.gz (RAS) both disagree with this,
+# and with each other, despite sharing the same physical atlas space.
+BRATS_REFERENCE_ORIENTATION = "LPS"
 DEFAULT_SKULL_STRIPPED_NONZERO_THRESHOLD = 0.40
 
 # Same channel->filename mapping as register_to_sri24.py's SRI24_CHANNELS,
@@ -74,17 +83,10 @@ DEFAULT_TEMPLATE_CACHE_DIR = Path(__file__).resolve().parent.parent / "templates
 
 
 def resolve_reference_orientation(template_channel: str, template_cache_dir: Path) -> str:
-    template_path = template_cache_dir / SRI24_CHANNEL_FILES[template_channel]
-    if template_path.is_file():
-        return "".join(nib.aff2axcodes(nib.load(str(template_path)).affine))
-    logger.warning(
-        "%s not cached locally (run register_to_sri24.py --download-only --template-channel %s) -- "
-        "falling back to the spgr-derived orientation reference '%s', which may not match this channel",
-        template_path,
-        template_channel,
-        BRATS_REFERENCE_ORIENTATION_FALLBACK,
-    )
-    return BRATS_REFERENCE_ORIENTATION_FALLBACK
+    """Kept for CLI-signature compatibility (template_channel/template_cache_dir
+    are still accepted) but no longer reads the atlas cache -- see
+    BRATS_REFERENCE_ORIENTATION's comment for why that was unreliable."""
+    return BRATS_REFERENCE_ORIENTATION
 
 REQUIRED_MODALITIES = ["T1", "T1c", "T2", "FLAIR"]
 # Checked in this order -- "t1c"/"t2f" are substrings of naive "t1"/"t2"
@@ -243,7 +245,7 @@ def format_report_text(
     lines.append(f"Files found: {len(file_reports)}")
     lines.append(
         f"BraTS/SRI24 reference: shape={BRATS_REFERENCE_SHAPE}, spacing={BRATS_REFERENCE_SPACING_MM}mm, "
-        f"orientation={reference_orientation} (--template-channel {template_channel}), "
+        f"orientation={reference_orientation}, "
         f"skull-stripped-nonzero-threshold={skull_stripped_threshold:.0%}"
     )
     lines.append("")

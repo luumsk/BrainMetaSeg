@@ -16,7 +16,10 @@ group, not as independent files:
        reference image only. The resulting mask is reused (not
        recomputed) for the other 3 modalities.
     5. Z-score intensity normalization (--normalize), per modality, within
-       the shared brain mask.
+       the shared brain mask. OFF by default -- see PreprocessSettings.do_normalize.
+Every final output (image, label, mask) is reoriented to BRATS_REFERENCE_ORIENTATION
+right before it's saved, regardless of which SRI24 channel it was registered
+to -- see the comment on that constant for why this matters.
 A single ground-truth label (--labels-dir) rides along through the SAME
 composed transform as its host modality (FLAIR, via the "braintracking"
 naming scheme) and gets masked with the same shared brain mask.
@@ -69,7 +72,6 @@ from check_brats_format import (
     BRATS_REFERENCE_SPACING_MM,
     DEFAULT_SKULL_STRIPPED_NONZERO_THRESHOLD,
     guess_modality,
-    resolve_reference_orientation,
 )
 from register_to_sri24 import (
     DEFAULT_TEMPLATE_CACHE_DIR,
@@ -86,6 +88,31 @@ logger = logging.getLogger("preprocess_brats")
 
 INTERP_CODES = {"linear": 0, "nearestNeighbor": 1, "bSpline": 4}  # ants.resample_image's interp_type
 MASK_SUFFIX = "_bet.nii.gz"  # HD-BET's own convention for --save_bet_mask output
+
+# Official BraTS/BraTS-MET orientation (confirmed against a real BraTS-MET
+# case's header) -- distinct from either locally-cached SRI24 atlas
+# channel's own header (spgr=LAS, spgr_unstrip=RAS), despite all three
+# sharing the same physical atlas space. nnU-Net's default SimpleITKIO
+# reader doesn't reorient to a canonical direction, so without this
+# explicit reorient step, final output silently inherits whatever
+# convention the registration target's header happened to use.
+BRATS_REFERENCE_ORIENTATION = ("L", "P", "S")
+
+
+def reorient_to_target(img: "nib.Nifti1Image", target_axcodes: tuple = BRATS_REFERENCE_ORIENTATION) -> "nib.Nifti1Image":
+    current_ornt = nib.io_orientation(img.affine)
+    target_ornt = nib.orientations.axcodes2ornt(target_axcodes)
+    transform = nib.orientations.ornt_transform(current_ornt, target_ornt)
+    return img.as_reoriented(transform)
+
+
+def reorient_file_to_target(path: Path, target_axcodes: tuple = BRATS_REFERENCE_ORIENTATION) -> None:
+    """Reorient an already-saved NIfTI file in place (used for the mask/label
+    outputs, which -- unlike the main image -- aren't already passing through
+    stage3_finalize_image's reorient_to_target call)."""
+    img = nib.load(str(path))
+    reoriented = reorient_to_target(img, target_axcodes)
+    nib.save(reoriented, str(path))
 
 # BraTS intra-subject co-registration reference priority (T1w > T2w > T1Gd >
 # FLAIR) -- the first of these present in a timepoint is the modality every
@@ -121,7 +148,14 @@ class PreprocessSettings:
     do_skull_strip: bool = True
     hdbet_device: str = ""  # "" -> auto-detect (cuda if available, else cpu)
     hdbet_disable_tta: bool = False
-    do_normalize: bool = True
+    # Default False: imagesTr is nnU-Net's *raw* dataset format, which must
+    # carry raw intensities -- nnU-Net computes and applies its own z-score
+    # normalization from the plans it derives at training time, and reuses
+    # those exact parameters at inference. Pre-normalizing here and letting
+    # nnU-Net normalize again on top double-applies the transform against a
+    # distribution shape (already ~mean 0/std 1) that no longer resembles
+    # the raw intensities nnU-Net's normalization was fit against.
+    do_normalize: bool = False
 
 
 @dataclass
@@ -401,6 +435,8 @@ def stage3_finalize_image(
     else:
         out_img = img
         info["brain_mean_raw"], info["brain_std_raw"] = None, None
+
+    out_img = reorient_to_target(out_img)
 
     out_image_path.parent.mkdir(parents=True, exist_ok=True)
     nib.save(out_img, str(out_image_path))
@@ -713,6 +749,10 @@ def run(
             final_mask_path = masks_dir / f"{case_id}_mask.nii.gz"
             final_mask_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(mask_path, final_mask_path)
+            # Keep the QC/audit mask on the same grid+orientation as the
+            # final images it was derived from (stage3_finalize_image
+            # reorients those; this copy predates that step).
+            reorient_file_to_target(final_mask_path)
 
         for modality, stage1_path in stage1_paths.items():
             t0 = time.time()
@@ -761,6 +801,10 @@ def run(
                         final_label_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copyfile(c["stage1_label_path"], final_label_path)
                         label_result.label_status = "ok"
+                    if label_result.label_status == "ok":
+                        # Keep the label on the same grid+orientation as its
+                        # image (stage3_finalize_image reorients that).
+                        reorient_file_to_target(final_label_path)
                     label_result.label_output_path = final_label_path
                     label_result.output_path = final_label_path
                     label_result.status = "ok" if label_result.label_status == "ok" else "failed"
@@ -799,9 +843,11 @@ def run(
 
     # ---- Verification (independent re-check of the saved output files) --
     if verify:
-        reference_orientation = None
-        if settings.do_register:
-            reference_orientation = resolve_reference_orientation(template_channel, template_cache_dir)
+        # Every final output is explicitly reoriented to BRATS_REFERENCE_ORIENTATION
+        # in stage3_finalize_image/reorient_file_to_target, regardless of which
+        # atlas channel registration used -- so that's what to verify against,
+        # not whatever resolve_reference_orientation would read off the atlas.
+        reference_orientation = "".join(BRATS_REFERENCE_ORIENTATION)
         image_results = [r for r in results if r.modality != "label"]
         verifications = run_verification(image_results, settings, reference_orientation)
         pd.DataFrame([asdict(v) for v in verifications]).to_csv(output_dir / "verification_report.csv", index=False)
@@ -947,7 +993,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hdbet-device", default="", help="cpu, cuda, or mps -- empty auto-detects (cuda if available, else cpu)")
     parser.add_argument("--hdbet-disable-tta", action="store_true", help="Disable HD-BET test-time augmentation (faster, slightly lower quality -- consider it on cpu)")
 
-    parser.add_argument("--normalize", dest="do_normalize", action=argparse.BooleanOptionalAction, default=True, help="Step 5: z-score intensity normalization within the shared brain mask")
+    parser.add_argument("--normalize", dest="do_normalize", action=argparse.BooleanOptionalAction, default=False, help="Step 5: z-score intensity normalization within the shared brain mask -- OFF by default: nnU-Net's raw dataset format expects raw intensities and normalizes itself at train/inference time, using parameters fit against a raw distribution, so pre-normalizing here causes double normalization")
 
     parser.add_argument("--save-transforms", action=argparse.BooleanOptionalAction, default=True, help="Persist each case's registration transforms under output_dir/transforms/ (only if --register)")
     parser.add_argument(

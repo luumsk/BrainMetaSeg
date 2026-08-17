@@ -24,12 +24,17 @@ LABELS_NAMING_SCHEME="braintracking"           # identical, or braintracking (sc
 # docstring for the full step order/rationale.
 N4_CORRECT=true                                # step 1
 REGISTER=true                                  # step 2 -- also yields isotropic spacing as a side effect
-TEMPLATE_CHANNEL="spgr_unstrip"                # skull-on SRI24 channel -- use spgr if your inputs are already skull-stripped
+TEMPLATE_CHANNEL="spgr_unstrip"                # skull-on SRI24 channel -- use spgr if your inputs are already skull-stripped.
+                                                # Orientation is independent of this choice: preprocess_brats.py always
+                                                # reorients final output to LPS (true BraTS/BraTS-MET convention),
+                                                # regardless of which channel's own header orientation was registered to.
 TRANSFORM_TYPE="Rigid"                         # BraTS uses rigid, not affine -- preserves true volume
 INTERPOLATOR="linear"
 RESAMPLE=true                                  # step 3 -- only takes effect if REGISTER=false
 SKULL_STRIP=true                               # step 4 (HD-BET, reference modality only, mask shared across the timepoint)
-NORMALIZE=true                                 # step 5 -- z-score within the shared brain mask
+NORMALIZE=false                                # step 5 -- z-score within the shared brain mask; OFF because nnU-Net
+                                                # normalizes raw intensities itself at train/inference time -- see
+                                                # utils/preprocess_brats.py's PreprocessSettings.do_normalize comment
 
 HDBET_DEVICE=""                                # empty -> auto-detect (cuda if available, else cpu); or "cpu"/"cuda"/"mps"
 HDBET_DISABLE_TTA=false                        # true trades a little quality for speed -- consider it if still on cpu
